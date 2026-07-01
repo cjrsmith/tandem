@@ -84,15 +84,20 @@ function M.pick_granularity()
 	end)
 end
 
--- Start a new working session: the next bubble begins fresh (no shared memory).
+-- Start a new working session in the current workpackage (fresh conversation).
 function M.new_session()
-	M.active_session = nil
+	if M.set_active_session then
+		M.set_active_session(nil)
+	else
+		M.active_session = nil
+	end
 	vim.notify("Loupe: new working session")
 	M.rail_refresh()
 end
 
 function M.setup(opts)
 	M.opts = opts or {}
+	pcall(M.wp_load) -- adopt the active workpackage's session on startup
 end
 
 function M.suggest(lines)
@@ -782,7 +787,7 @@ function M.chat_here(mode, scope, opts)
 	end
 	local function set_session(id)
 		if mode == "working" then
-			M.active_session = id
+			M.set_active_session(id) -- persist onto the active workpackage
 		else
 			local_session = id
 		end
@@ -1604,17 +1609,157 @@ function M.fetch_history(session, cb)
 	send_cmd({ cmd = "history", tag = tag, session = session })
 end
 
+-- ── Workpackages (named session + journal + backlog) ────────────
+-- A workpackage is a named working context: its own opencode session, a journal
+-- (the brief/plan/decisions for this chunk of work), and a backlog. No workpackage
+-- selected → a "default" one. Switching workpackage = switching session + loading
+-- its journal/backlog. Big repos have several (refactor, docker, …); small ones one.
+local function wp_root()
+	return vim.fn.getcwd() .. "/.loupe/wp"
+end
+local function wp_dir(name)
+	return wp_root() .. "/" .. name
+end
+function M.wp_journal_path(name)
+	return wp_dir(name or M.wp_active()) .. "/journal.md"
+end
+function M.wp_backlog_path(name)
+	return wp_dir(name or M.wp_active()) .. "/backlog.md"
+end
+
+local function wp_read_manifest()
+	local p = wp_root() .. "/manifest.json"
+	if vim.fn.filereadable(p) == 1 then
+		local ok, data = pcall(vim.json.decode, table.concat(vim.fn.readfile(p), "\n"))
+		if ok and type(data) == "table" and type(data.packages) == "table" then
+			return data
+		end
+	end
+	return { active = "default", packages = { ["default"] = {} } }
+end
+local function wp_write_manifest(m)
+	vim.fn.mkdir(wp_root(), "p")
+	vim.fn.writefile({ vim.json.encode(m) }, wp_root() .. "/manifest.json")
+end
+local function wp_manifest()
+	if not M._wp then
+		M._wp = wp_read_manifest()
+	end
+	return M._wp
+end
+
+-- The active workpackage name (ensuring a default exists).
+function M.wp_active()
+	local m = wp_manifest()
+	if not m.active or not m.packages[m.active] then
+		m.active = "default"
+		m.packages["default"] = m.packages["default"] or {}
+	end
+	return m.active
+end
+
+-- Point M.active_session at the active workpackage's stored session (call at startup).
+function M.wp_load()
+	local m = wp_manifest()
+	local name = M.wp_active()
+	M.active_session = m.packages[name] and m.packages[name].session or nil
+	M.rail_refresh()
+end
+
+-- Set the working session AND persist it onto the active workpackage.
+function M.set_active_session(id)
+	M.active_session = id
+	local m = wp_manifest()
+	local name = M.wp_active()
+	m.packages[name] = m.packages[name] or {}
+	m.packages[name].session = id
+	wp_write_manifest(m)
+end
+
+-- Switch to an existing workpackage (loads its session + journal/backlog context).
+function M.wp_switch_to(name)
+	local m = wp_manifest()
+	if not m.packages[name] then
+		return
+	end
+	m.active = name
+	wp_write_manifest(m)
+	M.active_session = m.packages[name].session
+	M.rail_refresh()
+	vim.notify("Loupe workpackage → " .. name)
+end
+
+-- Create a new workpackage (fresh session) and switch to it.
+function M.wp_create(name)
+	name = name and vim.trim(name) or ""
+	if name == "" then
+		return
+	end
+	local m = wp_manifest()
+	m.packages[name] = m.packages[name] or {}
+	m.active = name
+	wp_write_manifest(m)
+	vim.fn.mkdir(wp_dir(name), "p")
+	M.active_session = m.packages[name].session -- nil = fresh
+	M.rail_refresh()
+	vim.notify("Loupe workpackage → " .. name)
+end
+
+-- List/switch workpackages (or create a new one).
+function M.wp_pick()
+	local m = wp_manifest()
+	local names = {}
+	for n in pairs(m.packages) do
+		names[#names + 1] = n
+	end
+	table.sort(names)
+	names[#names + 1] = "+ new workpackage…"
+	vim.ui.select(names, { prompt = "Workpackage (active: " .. M.wp_active() .. ")" }, function(choice)
+		if not choice then
+			return
+		end
+		if choice == "+ new workpackage…" then
+			M.ask(function(name)
+				M.wp_create(name)
+			end, { title = " new workpackage name " })
+		else
+			M.wp_switch_to(choice)
+		end
+	end)
+end
+
+-- Rename the active workpackage.
+function M.wp_rename()
+	local old = M.wp_active()
+	M.ask(function(new)
+		new = vim.trim(new)
+		if new == "" or new == old then
+			return
+		end
+		local m = wp_manifest()
+		m.packages[new] = m.packages[old]
+		m.packages[old] = nil
+		m.active = new
+		wp_write_manifest(m)
+		pcall(os.rename, wp_dir(old), wp_dir(new))
+		M.rail_refresh()
+		vim.notify("Renamed workpackage → " .. new)
+	end, { title = " rename '" .. old .. "' to " })
+end
+
+-- The active workpackage's journal (its brief/plan/decisions), injected as context.
 function M.read_journal()
-	local path = vim.fn.getcwd() .. "/.loupe/journal.md"
+	local path = M.wp_journal_path()
 	if vim.fn.filereadable(path) == 0 then
 		return ""
 	end
 	return table.concat(vim.fn.readfile(path), "\n")
 end
 
--- Append an entry to the project journal under a timestamped heading.
+-- Append an entry to the active workpackage's journal under a timestamped heading.
 function M.journal_append(entry)
-	local path = vim.fn.getcwd() .. "/.loupe/journal.md"
+	local path = M.wp_journal_path()
+	vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
 	local lines = { "", "## " .. os.date("%Y-%m-%d %H:%M") }
 	for _, l in ipairs(vim.split(entry, "\n", { plain = true })) do
 		lines[#lines + 1] = l
@@ -1630,6 +1775,128 @@ function M.journal_note()
 			M.journal_append(note)
 		end
 	end)
+end
+
+-- ── Backlog (per-workpackage, priority-ordered tasks) ───────────
+-- Parse the active workpackage's backlog.md into { done, text, lnum } (file order
+-- = priority order). Stored as a markdown checklist so it's hand-editable.
+function M.backlog_parse()
+	local path = M.wp_backlog_path()
+	if vim.fn.filereadable(path) == 0 then
+		return {}
+	end
+	local items = {}
+	for i, l in ipairs(vim.fn.readfile(path)) do
+		local mark, text = l:match("^%s*%- %[([ xX])%]%s*(.*)$")
+		if mark then
+			items[#items + 1] = { done = (mark ~= " "), text = text, lnum = i }
+		end
+	end
+	return items
+end
+
+-- Append a task to the active workpackage's backlog.
+function M.backlog_add(text)
+	text = text and vim.trim(text) or ""
+	if text == "" then
+		return
+	end
+	local path = M.wp_backlog_path()
+	vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
+	if vim.fn.filereadable(path) == 0 then
+		vim.fn.writefile({ "# Backlog", "" }, path)
+	end
+	vim.fn.writefile({ "- [ ] " .. text }, path, "a")
+	M.rail_refresh()
+	vim.notify("Backlog + " .. text)
+end
+
+-- Jot a backlog item via the input bubble.
+function M.backlog_note()
+	M.ask(function(t)
+		M.backlog_add(t)
+	end, { title = " new backlog item " })
+end
+
+-- Open the full backlog: a real markdown buffer you edit / reorder / check off.
+-- <CR> toggles done · <M-j>/<M-k> move the line · q saves + closes.
+function M.backlog()
+	local path = M.wp_backlog_path()
+	vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
+	if vim.fn.filereadable(path) == 0 then
+		vim.fn.writefile({ "# Backlog", "", "- [ ] write tasks here — top line = highest priority" }, path)
+	end
+	local W = math.floor(vim.o.columns * 0.6)
+	local H = math.floor(vim.o.lines * 0.7)
+	local buf = vim.fn.bufadd(path)
+	vim.fn.bufload(buf)
+	vim.bo[buf].filetype = "markdown"
+	local win = vim.api.nvim_open_win(buf, true, {
+		relative = "editor", row = math.floor((vim.o.lines - H) / 2), col = math.floor((vim.o.columns - W) / 2),
+		width = W, height = H, style = "minimal", border = "rounded",
+		title = " backlog · " .. M.wp_active() .. " · <CR> toggle · M-j/M-k move · q save ",
+		title_pos = "center",
+	})
+	vim.wo[win].wrap, vim.wo[win].linebreak, vim.wo[win].conceallevel = true, true, 2
+	vim.wo[win].winhighlight = "FloatBorder:LoupeBorderActive"
+	vim.keymap.set("n", "<CR>", function()
+		local l = vim.api.nvim_get_current_line()
+		if l:match("^%s*%- %[ %]") then
+			l = l:gsub("%- %[ %]", "- [x]", 1)
+		elseif l:match("^%s*%- %[[xX]%]") then
+			l = l:gsub("%- %[[xX]%]", "- [ ]", 1)
+		end
+		vim.api.nvim_set_current_line(l)
+	end, { buffer = buf })
+	vim.keymap.set("n", "<M-j>", "<cmd>silent! move +1<cr>", { buffer = buf })
+	vim.keymap.set("n", "<M-k>", "<cmd>silent! move -2<cr>", { buffer = buf })
+	vim.keymap.set("n", "q", function()
+		pcall(function()
+			vim.cmd("silent write")
+		end)
+		if vim.api.nvim_win_is_valid(win) then
+			vim.api.nvim_win_close(win, true)
+		end
+		M.rail_refresh()
+	end, { buffer = buf })
+end
+
+-- Planning: turn a goal (+ the journal brief) into a prioritized backlog via the AI,
+-- appended to the active workpackage's backlog. Also the "manual setup" command.
+function M.plan()
+	M.ask(function(goal)
+		goal = vim.trim(goal or "")
+		local journal = M.read_journal()
+		local prompt = (journal ~= "" and ("Project brief:\n" .. journal .. "\n\n") or "")
+			.. "Goal: "
+			.. (goal ~= "" and goal or "(plan the next steps for the brief above)")
+			.. "\n\nBreak this into a PRIORITIZED backlog of concrete, actionable tasks (highest priority "
+			.. "first). Reply with ONLY a markdown checklist — one task per line:\n- [ ] first task\n- [ ] second task"
+		local acc = ""
+		vim.notify("Loupe: planning the backlog…")
+		M.prompt(nil, prompt, function(msg)
+			if msg.type == "delta" then
+				acc = acc .. msg.text
+			elseif msg.type == "done" then
+				local tasks = {}
+				for line in (acc .. "\n"):gmatch("(.-)\n") do
+					local t = line:match("^%s*%- %[[ xX]%]%s*(.+)$") or line:match("^%s*[%-%*]%s+(.+)$")
+					if t then
+						tasks[#tasks + 1] = vim.trim((t:gsub("^%[[ xX]%]%s*", "")))
+					end
+				end
+				if #tasks == 0 then
+					vim.notify("Loupe: couldn't parse a backlog from the reply")
+					return
+				end
+				for _, t in ipairs(tasks) do
+					M.backlog_add(t)
+				end
+				vim.notify("Loupe: added " .. #tasks .. " tasks to the backlog")
+				M.backlog()
+			end
+		end, false, { agent = "plan", tools = { write = false, edit = false, patch = false } })
+	end, { title = " plan: what's the goal? " })
 end
 
 -- ── Toasts (bottom-screen notifications) ────────────────────────
@@ -1819,7 +2086,7 @@ function M.run(session, text)
 	local acc = ""
 	M.prompt(session, text, function(msg)
 		if msg.type == "session" then
-			M.active_session = msg.id
+			M.set_active_session(msg.id)
 			session = msg.id
 		elseif msg.type == "delta" then
 			acc = acc .. msg.text
@@ -1968,7 +2235,10 @@ function M.settings_menu()
 		{ label = "Follow (toggle)", run = M.toggle_follow },
 		{ label = "Typing pace", run = M.pick_granularity },
 		{ label = "New session", run = M.new_session },
-		{ label = "Clear to-dos", run = M.todos_clear },
+		{ label = "Switch workpackage", run = M.wp_pick },
+		{ label = "Rename workpackage", run = M.wp_rename },
+		{ label = "Open backlog", run = M.backlog },
+		{ label = "Plan backlog (AI)", run = M.plan },
 	}
 	vim.ui.select(items, {
 		prompt = "Loupe settings:",
@@ -2035,32 +2305,36 @@ function M.render_rail(buf, todo)
 	lines[#lines + 1] = "  Follow   " .. (M.follow and "on" or "off")
 	lines[#lines + 1] = "  Model    " .. (M.active_model and M.active_model.label or "?")
 	lines[#lines + 1] = "  Pace     " .. M.granularity
+	lines[#lines + 1] = "  Package  " .. (pcall(M.wp_active) and M.wp_active() or "default")
 	lines[#lines + 1] = "  Session  " .. sid()
-	if todo then
+	if todo then -- the command centre shows the workpackage backlog (top few)
 		lines[#lines + 1] = ""
 		lines[#lines + 1] = "  ──────────────"
 		lines[#lines + 1] = ""
-		local pending = 0
-		for _, t in ipairs(M.todos) do
-			if not t.done and (t.kind == "ask" or t.kind == "instruction") then
-				pending = pending + 1
+		local items = M.backlog_parse()
+		local open = 0
+		for _, it in ipairs(items) do
+			if not it.done then
+				open = open + 1
 			end
 		end
-		lines[#lines + 1] = "  🔔  TO-DO" .. (pending > 0 and ("  (" .. pending .. ")") or "")
+		lines[#lines + 1] = "  🗒  BACKLOG" .. (open > 0 and ("  (" .. open .. ")") or "")
 		lines[#lines + 1] = ""
-		if #M.todos == 0 then
-			lines[#lines + 1] = "  (nothing yet)"
+		if #items == 0 then
+			lines[#lines + 1] = "  (empty — <leader>lb)"
 		else
-			local icon = { ask = "❓", instruction = "▸", notify = "·" }
 			local shown = 0
-			for i = #M.todos, 1, -1 do -- newest first
-				local t = M.todos[i]
-				local mark = t.done and "✓" or (icon[t.kind] or "·")
-				lines[#lines + 1] = "  " .. mark .. " " .. fit(t.text, 22)
-				shown = shown + 1
-				if shown >= 6 then
-					break
+			for _, it in ipairs(items) do -- priority order = file order
+				if not it.done then
+					lines[#lines + 1] = "  ☐ " .. fit(it.text, 22)
+					shown = shown + 1
+					if shown >= 6 then
+						break
+					end
 				end
+			end
+			if shown == 0 then
+				lines[#lines + 1] = "  ✓ all done"
 			end
 		end
 	end
@@ -2109,7 +2383,7 @@ function M.open_chat()
 		end
 
 		panel_turn(P, M.active_session, input, text, function(id)
-			M.active_session = id
+			M.set_active_session(id)
 			M.rail_refresh()
 		end, function(acc)
 			M.handle_tags(acc, M.active_session)
