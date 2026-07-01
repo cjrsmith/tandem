@@ -5,9 +5,14 @@ local edit_ns = vim.api.nvim_create_namespace("loupe_edit") -- the "AI is writin
 
 -- Diff-style highlight over the region the AI is actively typing into. `default`
 -- so a user colourscheme can override it.
-vim.api.nvim_set_hl(0, "LoupeActiveEdit", { link = "DiffAdd", default = true })
+-- Subtle blue/grey wash over the region the AI is writing.
+vim.api.nvim_set_hl(0, "LoupeActiveEdit", { bg = "#2d3446" })
 vim.api.nvim_set_hl(0, "LoupeImplementing", { link = "Comment", default = true })
 local IMPL_LABEL = "⟨ implementing… ⟩" -- the marker shown above & below the AI's region
+
+local chat_ns = vim.api.nvim_create_namespace("loupe_chat") -- user-message backgrounds
+-- Subtle grey block behind YOUR messages in chat (like opencode/claude); overridable.
+vim.api.nvim_set_hl(0, "LoupeUserMsg", { bg = "#2b2b33", default = true })
 
 -- Mark a window as a Loupe surface (chat bubble / ask / instruction / command centre)
 -- so M.toggle_focus can cycle between them and your code without closing anything.
@@ -199,7 +204,7 @@ function M.accept_suggestion(opts)
 	M.clear_suggestion() -- remove the ghost preview
 	local origin_line = vim.api.nvim_buf_get_lines(s.buf, s.row - 1, s.row, false)[1] or ""
 	local gran = (opts and opts.granularity) or M.granularity
-	local intervals = { char = 12, word = 35, line = 120, paragraph = 250 }
+	local intervals = { char = 38, word = 75, line = 120, paragraph = 250 }
 	-- type it onto new lines just below the origin line, at the chosen granularity
 	M.type_out("\n" .. s.code, {
 		buf = s.buf,
@@ -625,16 +630,32 @@ local function make_panel(box, title_label)
 		set_active(conv_win)
 	end
 
-	-- append whole blocks to the transcript; autoscroll unless you're reading there
+	-- append whole blocks to the transcript; autoscroll unless you're reading there.
+	-- returns the 0-indexed start line where the block landed.
 	function P.append(block)
 		if not vim.api.nvim_buf_is_valid(conv_buf) then
 			return
 		end
 		local cnt = vim.api.nvim_buf_line_count(conv_buf)
 		local empty = (cnt == 1 and vim.api.nvim_buf_get_lines(conv_buf, 0, 1, false)[1] == "")
-		vim.api.nvim_buf_set_lines(conv_buf, empty and 0 or cnt, empty and 1 or cnt, false, block)
+		local start = empty and 0 or cnt
+		vim.api.nvim_buf_set_lines(conv_buf, start, empty and 1 or cnt, false, block)
 		if vim.api.nvim_win_is_valid(conv_win) and vim.api.nvim_get_current_win() ~= conv_win then
 			vim.api.nvim_win_set_cursor(conv_win, { vim.api.nvim_buf_line_count(conv_buf), 0 })
+		end
+		return start
+	end
+
+	-- append YOUR message as a grey-highlighted block (no "you ▸" prefix).
+	function P.append_user(text)
+		local lines = vim.split(text, "\n", { plain = true })
+		local n = #lines
+		lines[#lines + 1] = "" -- trailing gap
+		local start = P.append(lines)
+		if start then
+			for i = start, start + n - 1 do
+				pcall(vim.api.nvim_buf_set_extmark, conv_buf, chat_ns, i, 0, { line_hl_group = "LoupeUserMsg" })
+			end
 		end
 	end
 
@@ -658,9 +679,7 @@ end
 -- (markdown, loupe tags stripped) into the transcript, then call on_done(acc).
 -- on_session(id) fires when the session id is learned; `fork` forks the session.
 local function panel_turn(P, session, user_text, prompt_text, on_session, on_done, fork, opts)
-	local you = vim.split("you ▸ " .. user_text, "\n", { plain = true })
-	you[#you + 1] = ""
-	P.append(you)
+	P.append_user(user_text)
 	local acc, r_start, r_count = "", nil, nil
 	M.prompt(session, prompt_text, function(msg)
 		if msg.type == "session" then
@@ -672,7 +691,7 @@ local function panel_turn(P, session, user_text, prompt_text, on_session, on_don
 			if not vim.api.nvim_buf_is_valid(P.conv_buf) then
 				return -- panel closed mid-stream; stop touching it
 			end
-			local lines = vim.split("loupe ▸ " .. acc, "\n", { plain = true })
+			local lines = vim.split(acc, "\n", { plain = true })
 			if not r_start then
 				r_start = vim.api.nvim_buf_line_count(P.conv_buf)
 				r_count = 0
@@ -690,7 +709,7 @@ local function panel_turn(P, session, user_text, prompt_text, on_session, on_don
 					:gsub("<loupe:notify>.-</loupe:notify>", "")
 					:gsub("<loupe:ask>.-</loupe:ask>", "")
 					:gsub("<loupe:instruction>.-</loupe:instruction>", ""))
-				local lines = vim.split("loupe ▸ " .. vim.trim(display), "\n", { plain = true })
+				local lines = vim.split(vim.trim(display), "\n", { plain = true })
 				lines[#lines + 1] = ""
 				vim.api.nvim_buf_set_lines(P.conv_buf, r_start, r_start + r_count, false, lines)
 				r_count = #lines
@@ -726,9 +745,10 @@ local function cursor_box()
 	return { T = T, L = L, Wt = Wt, Ht = Ht, rail_w = 22, input_h = 4, min_lw = 24, todo = false }
 end
 
-function M.chat_here(mode, scope)
+function M.chat_here(mode, scope, opts)
 	mode = mode or "working" -- "working" | "ephemeral" | "fork"
 	scope = scope or "line" -- "line" | "selection" | "file"
+	opts = opts or {} -- { history = true } → render the session's prior messages on open
 	-- where to project a suggestion back to (the code you're working on)
 	local origin = { buf = vim.api.nvim_get_current_buf(), row = vim.api.nvim_win_get_cursor(0)[1] }
 	local context
@@ -868,7 +888,37 @@ function M.chat_here(mode, scope)
 		end, do_fork)
 	end)
 
+	-- optionally show the prior conversation (bring back the "previous chat")
+	if opts.history and get_session() then
+		M.fetch_history(get_session(), function(messages)
+			if not vim.api.nvim_buf_is_valid(P.conv_buf) then
+				return
+			end
+			for _, m in ipairs(messages) do
+				local txt = vim.trim((m.text or "")
+					:gsub("<loupe:suggest[^>]*>(.-)</loupe:suggest>", "%1")
+					:gsub("<loupe:notify>.-</loupe:notify>", "")
+					:gsub("<loupe:ask>.-</loupe:ask>", "")
+					:gsub("<loupe:instruction>.-</loupe:instruction>", ""))
+				if txt ~= "" then
+					if m.role == "user" then
+						P.append_user(txt)
+					else
+						local lines = vim.split(txt, "\n", { plain = true })
+						lines[#lines + 1] = ""
+						P.append(lines)
+					end
+				end
+			end
+		end)
+	end
+
 	P.focus_input()
+end
+
+-- Re-open the working chat as a bubble at the cursor, showing the conversation so far.
+function M.reopen_chat()
+	M.chat_here("working", "line", { history = true })
 end
 
 -- ── OpenCode backend ─────────────────────────────────────────────
@@ -1050,6 +1100,29 @@ local function send_cmd(cmd)
 	end
 end
 
+-- Run the typewriter now, or — when Follow is ON — hold it behind a confirmation so
+-- you always watch each write start. `fn` performs the actual type_out.
+local function gated_write(fn)
+	if M.follow then
+		M._pending_write = fn
+		M.toast("▶ ready to write here — confirm to watch it type", { sticky = true, title = " follow · confirm " })
+	else
+		fn()
+	end
+end
+
+-- Confirm a held write (Follow mode): let the AI start typing.
+function M.confirm_write()
+	local fn = M._pending_write
+	M._pending_write = nil
+	M.toast_dismiss()
+	if fn then
+		fn()
+	else
+		vim.notify("Loupe: nothing waiting to write")
+	end
+end
+
 -- The agent's loupe_write tool (via the daemon bridge) wants to write a file. We
 -- own application: type the content into the buffer with the watchable typewriter,
 -- persist it, then ack so the blocked tool returns and the agent continues.
@@ -1134,16 +1207,18 @@ function M.on_edit(msg)
 		span[#span + 1] = new_lines[i]
 	end
 	vim.api.nvim_buf_set_lines(buf, a_lo, a_hi, false, { "" })
-	local intervals = { char = 12, word = 35, line = 120, paragraph = 250 }
+	local intervals = { char = 38, word = 75, line = 120, paragraph = 250 }
 	local gran = M.granularity
-	M.type_out(table.concat(span, "\n"), {
-		buf = buf,
-		row = a_lo,
-		col = 0,
-		granularity = gran,
-		interval = intervals[gran] or 35,
-		on_done = finish,
-	})
+	gated_write(function()
+		M.type_out(table.concat(span, "\n"), {
+			buf = buf,
+			row = a_lo,
+			col = 0,
+			granularity = gran,
+			interval = intervals[gran] or 35,
+			on_done = finish,
+		})
+	end)
 end
 
 -- The agent's loupe_region tool: replace ONLY the currently-marked region (a
@@ -1181,24 +1256,26 @@ function M.on_region(msg)
 	else
 		M.toast("✎ implementing region — <leader>lg to follow")
 	end
-	local intervals = { char = 12, word = 35, line = 120, paragraph = 250 }
+	local intervals = { char = 38, word = 75, line = 120, paragraph = 250 }
 	local gran = M.granularity
-	M.type_out(content, {
-		buf = r.buf,
-		row = tr,
-		col = tc,
-		granularity = gran,
-		interval = intervals[gran] or 35,
-		on_done = function()
-			pcall(function()
-				vim.api.nvim_buf_call(r.buf, function()
-					vim.cmd("silent keepalt noautocmd write")
+	gated_write(function()
+		M.type_out(content, {
+			buf = r.buf,
+			row = tr,
+			col = tc,
+			granularity = gran,
+			interval = intervals[gran] or 35,
+			on_done = function()
+				pcall(function()
+					vim.api.nvim_buf_call(r.buf, function()
+						vim.cmd("silent keepalt noautocmd write")
+					end)
 				end)
-			end)
-			M._edit = nil -- region edit completed normally
-			send_cmd({ cmd = "edit_done", id = msg.id, message = "applied region edit" })
-		end,
-	})
+				M._edit = nil -- region edit completed normally
+				send_cmd({ cmd = "edit_done", id = msg.id, message = "applied region edit" })
+			end,
+		})
+	end)
 end
 
 -- The agent's loupe_ask tool: it needs a decision and is BLOCKED until you answer.
@@ -1217,7 +1294,7 @@ function M.on_ask(msg)
 		Wt = W, Ht = H, input_h = 4, no_rail = true,
 	}
 	local P = make_panel(box, "loupe asks · Enter = discuss · ^S = send answer")
-	P.append(vim.split("loupe ▸ " .. question, "\n", { plain = true }))
+	P.append(vim.split(question, "\n", { plain = true }))
 	P.append({ "" })
 
 	local fork_session, answered = nil, false
@@ -2039,25 +2116,28 @@ function M.open_chat()
 		end)
 	end)
 
-	-- render the session's prior messages into the transcript on open
+	-- render the session's prior messages into the transcript on open (user messages
+	-- as grey blocks, assistant plain — same styling as live turns)
 	M.fetch_history(M.active_session, function(messages)
 		if not vim.api.nvim_buf_is_valid(P.conv_buf) or #messages == 0 then
 			return
 		end
-		local out = {}
 		for _, m in ipairs(messages) do
-			local prefix = (m.role == "user") and "you ▸ " or "loupe ▸ "
-			local txt = (m.text or "")
+			local txt = vim.trim((m.text or "")
 				:gsub("<loupe:suggest[^>]*>(.-)</loupe:suggest>", "%1")
 				:gsub("<loupe:notify>.-</loupe:notify>", "")
 				:gsub("<loupe:ask>.-</loupe:ask>", "")
-				:gsub("<loupe:instruction>.-</loupe:instruction>", "")
-			for _, l in ipairs(vim.split(prefix .. vim.trim(txt), "\n", { plain = true })) do
-				out[#out + 1] = l
+				:gsub("<loupe:instruction>.-</loupe:instruction>", ""))
+			if txt ~= "" then
+				if m.role == "user" then
+					P.append_user(txt)
+				else
+					local lines = vim.split(txt, "\n", { plain = true })
+					lines[#lines + 1] = ""
+					P.append(lines)
+				end
 			end
-			out[#out + 1] = ""
 		end
-		P.append(out)
 	end)
 
 	P.focus_input()
