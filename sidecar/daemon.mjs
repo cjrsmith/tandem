@@ -22,7 +22,73 @@ import os from "node:os";
 import path from "node:path";
 
 const MODEL = { providerID: "opencode", modelID: "north-mini-code-free" };
-const VERSION = "2026-06-30 region edits";
+const VERSION = "2026-07-01 ask+notify+instruct";
+
+// loupe_instruct: the Navigator gives the human ONE directive (a next step). Sticky,
+// non-blocking — shown in the notification bar until dismissed / next asked.
+const LOUPE_INSTRUCT_TOOL = `import { tool } from "@opencode-ai/plugin"
+
+export default tool({
+  description: "Give the human ONE directive — the next step for them to do (they write the code; you guide). It appears in their notification bar and stays until they dismiss it or ask for the next step. Issue ONE instruction, then stop and wait — do not dump multiple steps at once.",
+  args: {
+    instruction: tool.schema.string().describe("A short, concrete next step for the human to do"),
+  },
+  async execute(args) {
+    const port = process.env.LOUPE_BRIDGE_PORT
+    if (!port) return "loupe_instruct is only available inside the Loupe editor."
+    await fetch("http://127.0.0.1:" + port + "/instruct", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ instruction: args.instruction }),
+    })
+    return "shown"
+  },
+})
+`;
+
+// loupe_ask: ask the user a question and BLOCK until they answer (returned as the
+// tool result). loupe_notify: fire-and-forget status line. Both reach the user
+// through the same bridge as the edit tools.
+const LOUPE_ASK_TOOL = `import { tool } from "@opencode-ai/plugin"
+
+export default tool({
+  description: "Ask the user a question and wait for their answer. Use whenever you need a decision from them — a name, a choice between approaches, confirmation before a structural change. In low autonomy, ask often (before naming functions/variables/files or making structural choices). Returns the user's answer.",
+  args: {
+    question: tool.schema.string().describe("The question to ask the user"),
+  },
+  async execute(args) {
+    const port = process.env.LOUPE_BRIDGE_PORT
+    if (!port) return "loupe_ask is only available inside the Loupe editor."
+    const res = await fetch("http://127.0.0.1:" + port + "/ask", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ question: args.question }),
+    })
+    const out = await res.json().catch(() => ({}))
+    return out.message || "(no answer)"
+  },
+})
+`;
+
+const LOUPE_NOTIFY_TOOL = `import { tool } from "@opencode-ai/plugin"
+
+export default tool({
+  description: "Briefly tell the user what you are doing or about to do (a short status line). Non-blocking: it shows a small notification and returns immediately. Use for significant steps, sparingly.",
+  args: {
+    message: tool.schema.string().describe("A short status message for the user"),
+  },
+  async execute(args) {
+    const port = process.env.LOUPE_BRIDGE_PORT
+    if (!port) return "loupe_notify is only available inside the Loupe editor."
+    await fetch("http://127.0.0.1:" + port + "/notify", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: args.message }),
+    })
+    return "shown"
+  },
+})
+`;
 
 // loupe_region: replace just the region the user selected/marked. Returns ONLY that
 // region's code (not the whole file) — Loupe places it between the marks while the
@@ -98,6 +164,9 @@ const LOUPE_CFG_DIR = path.join(os.homedir(), ".cache", "loupe", "opencode");
 fs.mkdirSync(path.join(LOUPE_CFG_DIR, "tools"), { recursive: true });
 fs.writeFileSync(path.join(LOUPE_CFG_DIR, "tools", "loupe_write.js"), LOUPE_WRITE_TOOL);
 fs.writeFileSync(path.join(LOUPE_CFG_DIR, "tools", "loupe_region.js"), LOUPE_REGION_TOOL);
+fs.writeFileSync(path.join(LOUPE_CFG_DIR, "tools", "loupe_ask.js"), LOUPE_ASK_TOOL);
+fs.writeFileSync(path.join(LOUPE_CFG_DIR, "tools", "loupe_notify.js"), LOUPE_NOTIFY_TOOL);
+fs.writeFileSync(path.join(LOUPE_CFG_DIR, "tools", "loupe_instruct.js"), LOUPE_INSTRUCT_TOOL);
 process.env.OPENCODE_CONFIG_DIR = LOUPE_CFG_DIR;
 
 const pendingEdits = new Map(); // editID -> pending http response (the blocked tool)
@@ -118,6 +187,30 @@ const bridge = http.createServer((req, res) => {
     takeBody(req, res, (id, e) => send({ type: "edit", id, file: e.file, content: e.content }));
   } else if (req.method === "POST" && req.url === "/region") {
     takeBody(req, res, (id, e) => send({ type: "region", id, content: e.code }));
+  } else if (req.method === "POST" && req.url === "/ask") {
+    // blocking: relay the question, resolve when Neovim replies with the answer
+    takeBody(req, res, (id, e) => send({ type: "ask", id, question: e.question }));
+  } else if (req.method === "POST" && req.url === "/notify") {
+    // fire-and-forget: show it and return immediately
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      let e = {};
+      try { e = JSON.parse(body || "{}"); } catch {}
+      send({ type: "notify", message: e.message });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"message":"shown"}');
+    });
+  } else if (req.method === "POST" && req.url === "/instruct") {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      let e = {};
+      try { e = JSON.parse(body || "{}"); } catch {}
+      send({ type: "instruct", instruction: e.instruction });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"message":"shown"}');
+    });
   } else {
     res.writeHead(404);
     res.end();

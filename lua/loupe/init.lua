@@ -8,6 +8,16 @@ local edit_ns = vim.api.nvim_create_namespace("loupe_edit") -- the "AI is writin
 vim.api.nvim_set_hl(0, "LoupeActiveEdit", { link = "DiffAdd", default = true })
 vim.api.nvim_set_hl(0, "LoupeImplementing", { link = "Comment", default = true })
 local IMPL_LABEL = "⟨ implementing… ⟩" -- the marker shown above & below the AI's region
+
+-- Mark a window as a Loupe surface (chat bubble / ask / instruction / command centre)
+-- so M.toggle_focus can cycle between them and your code without closing anything.
+local function mark_surface(win)
+	pcall(vim.api.nvim_win_set_var, win, "loupe_surface", true)
+end
+local function is_surface(win)
+	local ok, v = pcall(vim.api.nvim_win_get_var, win, "loupe_surface")
+	return ok and v == true
+end
 -- Shared border highlights so bubbles and the command centre look the same.
 vim.api.nvim_set_hl(0, "LoupeBorderActive", { link = "Function", default = true })
 vim.api.nvim_set_hl(0, "LoupeBorderDim", { link = "Comment", default = true })
@@ -444,7 +454,10 @@ function M.bubble(lines)
 	return win, buf
 end
 
-function M.ask(on_submit)
+-- `opts` (optional): { title, on_cancel }. on_cancel fires if you dismiss with <Esc>
+-- (so a blocked question still gets released).
+function M.ask(on_submit, opts)
+	opts = opts or {}
 	local buf = vim.api.nvim_create_buf(false, true)
 	vim.bo[buf].bufhidden = "wipe"
 	local win = vim.api.nvim_open_win(buf, true, {
@@ -456,10 +469,11 @@ function M.ask(on_submit)
 		height = 1,
 		style = "minimal",
 		border = "rounded",
-		title = " ask loupe ",
+		title = opts.title or " ask loupe ",
 		title_pos = "center",
 	})
 	vim.wo[win].winhighlight = "FloatBorder:LoupeBorderActive"
+	mark_surface(win)
 	vim.cmd("startinsert") -- drop straight into insert mode, ready to type
 
 	-- submit: grab the buffer text, close, hand it to the callback
@@ -473,6 +487,9 @@ function M.ask(on_submit)
 
 	vim.keymap.set("n", "<Esc>", function()
 		vim.api.nvim_win_close(win, true)
+		if opts.on_cancel then
+			opts.on_cancel()
+		end
 	end, { buffer = buf })
 end
 
@@ -526,8 +543,8 @@ end
 -- geometry { T, L, Wt, Ht, rail_w, input_h, min_lw } in editor cells.
 local function make_panel(box, title_label)
 	local T, L, Wt, Ht = box.T, box.L, box.Wt, box.Ht
-	local RW = box.rail_w
-	local LW = math.max(box.min_lw or 24, Wt - RW - 1)
+	local RW = box.rail_w or 0
+	local LW = box.no_rail and Wt or math.max(box.min_lw or 24, Wt - RW - 1)
 	local IH = box.input_h
 	local CH = math.max(3, Ht - IH - 1)
 
@@ -537,8 +554,6 @@ local function make_panel(box, title_label)
 	vim.bo[input_buf].bufhidden = "wipe"
 	vim.bo[input_buf].buftype = "prompt"
 	vim.fn.prompt_setprompt(input_buf, "> ")
-	local rail_buf = vim.api.nvim_create_buf(false, true)
-	vim.bo[rail_buf].bufhidden = "wipe"
 
 	local conv_win = vim.api.nvim_open_win(conv_buf, false, {
 		relative = "editor", row = T + 1, col = L + 1, width = LW - 2, height = CH - 2,
@@ -548,18 +563,26 @@ local function make_panel(box, title_label)
 		relative = "editor", row = T + CH + 2, col = L + 1, width = LW - 2, height = IH - 2,
 		style = "minimal", border = "rounded", title = " message ", title_pos = "left",
 	})
-	local rail_win = vim.api.nvim_open_win(rail_buf, false, {
-		relative = "editor", row = T + 1, col = L + LW + 1, width = RW - 2, height = Ht - 2,
-		style = "minimal", border = "rounded", focusable = false,
-	})
 	vim.wo[conv_win].wrap, vim.wo[conv_win].linebreak = true, true
 	style_markdown(conv_buf, conv_win)
 	vim.wo[input_win].wrap = true
-	vim.wo[rail_win].winhighlight = "FloatBorder:LoupeBorderDim"
+	mark_surface(conv_win)
+	mark_surface(input_win)
 
-	M._rail_buf, M._rail_win = rail_buf, rail_win
-	M._rail_todo = box.todo ~= false -- bubbles omit the TO-DO panel (settings only)
-	M.render_rail(rail_buf, M._rail_todo)
+	local rail_buf, rail_win
+	if not box.no_rail then
+		rail_buf = vim.api.nvim_create_buf(false, true)
+		vim.bo[rail_buf].bufhidden = "wipe"
+		rail_win = vim.api.nvim_open_win(rail_buf, false, {
+			relative = "editor", row = T + 1, col = L + LW + 1, width = RW - 2, height = Ht - 2,
+			style = "minimal", border = "rounded", focusable = false,
+		})
+		vim.wo[rail_win].winhighlight = "FloatBorder:LoupeBorderDim"
+		mark_surface(rail_win)
+		M._rail_buf, M._rail_win = rail_buf, rail_win
+		M._rail_todo = box.todo ~= false -- bubbles omit the TO-DO panel (settings only)
+		M.render_rail(rail_buf, M._rail_todo)
+	end
 
 	local P = {
 		conv_buf = conv_buf, conv_win = conv_win,
@@ -634,7 +657,7 @@ end
 -- Stream one turn through a panel: echo the user's line, render the model's reply
 -- (markdown, loupe tags stripped) into the transcript, then call on_done(acc).
 -- on_session(id) fires when the session id is learned; `fork` forks the session.
-local function panel_turn(P, session, user_text, prompt_text, on_session, on_done, fork)
+local function panel_turn(P, session, user_text, prompt_text, on_session, on_done, fork, opts)
 	local you = vim.split("you ▸ " .. user_text, "\n", { plain = true })
 	you[#you + 1] = ""
 	P.append(you)
@@ -676,7 +699,7 @@ local function panel_turn(P, session, user_text, prompt_text, on_session, on_don
 				on_done(acc)
 			end
 		end
-	end, fork)
+	end, fork, opts)
 end
 
 -- Big centred box for the command centre.
@@ -974,6 +997,12 @@ local function on_stdout(_, data)
 					M.on_edit(msg) -- the agent's loupe_write tool wants to write a file
 				elseif msg.type == "region" then
 					M.on_region(msg) -- the agent's loupe_region tool — replace the marked region
+				elseif msg.type == "ask" then
+					M.on_ask(msg) -- the agent's loupe_ask tool — needs a decision from you
+				elseif msg.type == "notify" then
+					M.on_notify(msg) -- the agent's loupe_notify tool — a status line
+				elseif msg.type == "instruct" then
+					M.on_instruct(msg) -- the Navigator's loupe_instruct tool — a directive
 				elseif msg.type == "status" then
 					M.on_status(msg) -- one-line "what the AI is doing now"
 				elseif daemon.handlers[msg.tag] then
@@ -1170,6 +1199,149 @@ function M.on_region(msg)
 			send_cmd({ cmd = "edit_done", id = msg.id, message = "applied region edit" })
 		end,
 	})
+end
+
+-- The agent's loupe_ask tool: it needs a decision and is BLOCKED until you answer.
+-- We show the question and open an input; your answer (or a dismissal) is sent back
+-- as the tool result so the agent continues.
+function M.on_ask(msg)
+	local question = msg.question or "?"
+	-- A forked side-chat at the bottom of the screen: DISCUSS the question with a fork
+	-- (which has the full context) via Enter, then ^S to send your final answer — that
+	-- unblocks the original agent. The main agent stays frozen the whole time.
+	local W = math.floor(vim.o.columns * 0.7)
+	local H = math.min(16, vim.o.lines - 4)
+	local box = {
+		T = vim.o.lines - H - 2,
+		L = math.max(0, math.floor((vim.o.columns - W) / 2)),
+		Wt = W, Ht = H, input_h = 4, no_rail = true,
+	}
+	local P = make_panel(box, "loupe asks · Enter = discuss · ^S = send answer")
+	P.append(vim.split("loupe ▸ " .. question, "\n", { plain = true }))
+	P.append({ "" })
+
+	local fork_session, answered = nil, false
+	local function answer_with(text)
+		if answered then
+			return
+		end
+		answered = true
+		send_cmd({
+			cmd = "edit_done",
+			id = msg.id,
+			message = (text and text ~= "") and text or "(no answer — use your best judgement)",
+		})
+		P.close()
+	end
+
+	local discuss_system = 'You previously asked the user this question and they want to discuss it before deciding: "'
+		.. question
+		.. '". Talk it through — clarify what you meant, lay out options and trade-offs. Reply in plain text ONLY; do NOT call loupe_write, loupe_region, loupe_ask, loupe_instruct or any edit tool.'
+
+	-- Enter: discuss with a FORK of the working session (it inherits the context).
+	vim.fn.prompt_setcallback(P.input_buf, function(input)
+		if input == "" then
+			return
+		end
+		vim.schedule(function()
+			if vim.api.nvim_buf_is_valid(P.input_buf) then
+				local n = vim.api.nvim_buf_line_count(P.input_buf)
+				if n > 1 then
+					pcall(vim.api.nvim_buf_set_lines, P.input_buf, 0, n - 1, false, {})
+				end
+			end
+		end)
+		local do_fork = (fork_session == nil and M.active_session ~= nil)
+		local source = do_fork and M.active_session or fork_session
+		panel_turn(P, source, input, input, function(id)
+			fork_session = id
+		end, nil, do_fork, {
+			system = discuss_system,
+			agent = "plan",
+			tools = { write = false, edit = false, patch = false },
+		})
+	end)
+
+	-- ^S: take the current input line as the final answer (unblocks the agent).
+	local function submit_answer()
+		local lines = vim.api.nvim_buf_get_lines(P.input_buf, 0, -1, false)
+		local last = lines[#lines] or ""
+		answer_with(vim.trim((last:gsub("^> ?", ""))))
+	end
+	for _, b in ipairs({ P.input_buf, P.conv_buf }) do
+		vim.keymap.set({ "n", "i" }, "<C-s>", submit_answer, { buffer = b })
+		vim.keymap.set({ "n", "i" }, "<C-c>", function()
+			answer_with("(the user dismissed the question; use your best judgement)")
+		end, { buffer = b })
+		vim.keymap.set("n", "q", function()
+			answer_with("(the user dismissed the question; use your best judgement)")
+		end, { buffer = b })
+	end
+
+	P.focus_input()
+end
+
+-- The agent's loupe_notify tool: a transient status line (non-blocking).
+function M.on_notify(msg)
+	if msg.message and msg.message ~= "" then
+		M.toast(msg.message)
+	end
+end
+
+-- The Navigator's loupe_instruct tool: a directive (next step for you). Opens a
+-- formatted (markdown) side-chat seeded with the instruction so you can SEE it nicely
+-- and DISCUSS it (via a fork) before doing it — like the question flow, but since it's
+-- non-blocking there's no answer to send: just q when you're ready to go do the work.
+function M.on_instruct(msg)
+	local instr = msg.instruction or ""
+	if instr == "" then
+		return
+	end
+	M.last_instruction = instr
+	M.todo_add("instruction", instr)
+	M.rail_refresh()
+
+	local W = math.floor(vim.o.columns * 0.7)
+	local H = math.min(16, vim.o.lines - 4)
+	local box = {
+		T = vim.o.lines - H - 2,
+		L = math.max(0, math.floor((vim.o.columns - W) / 2)),
+		Wt = W, Ht = H, input_h = 4, no_rail = true,
+	}
+	local P = make_panel(box, "loupe · instruction · Enter = discuss · q = done")
+	P.append(vim.split("▸ " .. instr, "\n", { plain = true }))
+	P.append({ "" })
+
+	local fork_session = nil
+	local discuss_system = 'You gave the user this instruction and they want to discuss it before doing it: "'
+		.. instr
+		.. '". Clarify and talk it through in plain text ONLY. Do NOT issue new instructions or call any tool.'
+
+	vim.fn.prompt_setcallback(P.input_buf, function(input)
+		if input == "" then
+			return
+		end
+		vim.schedule(function()
+			if vim.api.nvim_buf_is_valid(P.input_buf) then
+				local n = vim.api.nvim_buf_line_count(P.input_buf)
+				if n > 1 then
+					pcall(vim.api.nvim_buf_set_lines, P.input_buf, 0, n - 1, false, {})
+				end
+			end
+		end)
+		-- fork the working session so discussion never collides with the main turn
+		local do_fork = (fork_session == nil and M.active_session ~= nil)
+		local source = do_fork and M.active_session or fork_session
+		panel_turn(P, source, input, input, function(id)
+			fork_session = id
+		end, nil, do_fork, {
+			system = discuss_system,
+			agent = "plan",
+			tools = { write = false, edit = false, patch = false },
+		})
+	end)
+
+	P.focus_input()
 end
 
 -- PAUSE the AI mid-write so you can take the floor. Freezes the typewriter and ENDS
@@ -1403,6 +1575,12 @@ function M.toast(text, opts)
 		maxw = math.max(maxw, vim.fn.strdisplaywidth(l))
 	end
 	local width = math.min(maxw + 2, 70)
+	-- expand vertically to fit the WRAPPED text (long lines wrap to several rows)
+	local rows = 0
+	for _, l in ipairs(lines) do
+		rows = rows + math.max(1, math.ceil(vim.fn.strdisplaywidth(l) / width))
+	end
+	local height = math.max(1, math.min(rows, vim.o.lines - 4))
 	local buf = vim.api.nvim_create_buf(false, true)
 	vim.bo[buf].bufhidden = "wipe"
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
@@ -1412,7 +1590,7 @@ function M.toast(text, opts)
 		row = vim.o.lines - 2,
 		col = math.max(0, math.floor((vim.o.columns - width) / 2)), -- centered
 		width = width,
-		height = #lines,
+		height = height,
 		style = "minimal",
 		border = "rounded",
 		focusable = false,
@@ -1618,14 +1796,14 @@ M.follow = false -- when ON, jump to & watch the AI's edits live (else type off-
 
 local LEVEL_TEXT = {
 	navigator = {
-		high = "Guidance level: HIGH — give only the direction, not detailed steps.",
-		medium = "Guidance level: MEDIUM — give the key steps; leave details to the Driver.",
-		low = "Guidance level: LOW — give exact, step-by-step instructions.",
+		high = "Guidance level: HIGH — keep every direction (loupe_instruct) very high-level and conceptual: name the goal or the approach, not the steps. e.g. 'add input validation to the form'. Let the human work out the how.",
+		medium = "Guidance level: MEDIUM — give the key steps but not every detail: outline the moving parts. e.g. 'validate each field, then show errors next to the inputs'.",
+		low = "Guidance level: LOW — be granular and exact in each direction: tell them precisely what to do, step by step, down to specific names, signatures, and lines. e.g. 'in utils.lua add a function reverse(list) that loops from #list down to 1'.",
 	},
 	driver = {
-		high = "Autonomy: HIGH — work autonomously; give ONE <loupe:notify> summary at the end. Minimal chatter.",
-		medium = "Autonomy: MEDIUM — a short <loupe:notify> at each significant step.",
-		low = "Autonomy: LOW — narrate EVERY small change with a <loupe:notify> before doing it, and <loupe:ask> before any naming/structural choice.",
+		high = "Autonomy: HIGH — work autonomously. Minimal chatter: at most one loupe_notify at the end. Rarely use loupe_ask.",
+		medium = "Autonomy: MEDIUM — a short loupe_notify at each significant step; use loupe_ask only for genuine decisions.",
+		low = "Autonomy: LOW — narrate each significant change with loupe_notify, and use loupe_ask before ANY naming or structural choice (function/variable/file names, how to structure something) — stop and wait for the answer.",
 	},
 }
 
@@ -2009,12 +2187,18 @@ function M.review_show_summary()
 		width = math.max(width, vim.fn.strdisplaywidth(l))
 	end
 	width = math.min(math.max(width + 2, 30), 72)
+	-- expand vertically to fit the WRAPPED text (a long line wraps to several rows)
+	local rows = 0
+	for _, l in ipairs(lines) do
+		rows = rows + math.max(1, math.ceil(vim.fn.strdisplaywidth(l) / width))
+	end
+	local height = math.max(1, math.min(rows, vim.o.lines - 4))
 	local buf = vim.api.nvim_create_buf(false, true)
 	vim.bo[buf].bufhidden = "wipe"
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
 	review_box = vim.api.nvim_open_win(buf, false, {
 		relative = "cursor", anchor = "SW", row = 0, col = 2,
-		width = width, height = math.min(#lines, 12),
+		width = width, height = height,
 		style = "minimal", border = "rounded",
 		title = " why ", title_pos = "center",
 		focusable = false, noautocmd = true,
@@ -2126,6 +2310,53 @@ function M.review_exit()
 	pcall(vim.api.nvim_del_augroup_by_name, "LoupeReview")
 	pcall(vim.cmd, "cclose")
 	vim.notify("Loupe review: exited")
+end
+
+-- ── Surface focus / visibility ──────────────────────────────────
+-- Cycle focus around a ring of [ your code window, each open Loupe input surface ].
+-- So one key lets you leave an input (it stays open), pop to your buffer to make the
+-- change, and come back — and reach any of several stacked bubbles.
+function M.toggle_focus()
+	local ring = {}
+	for _, w in ipairs(vim.api.nvim_list_wins()) do -- one code (non-surface, non-float) window first
+		if vim.api.nvim_win_get_config(w).relative == "" and not is_surface(w) then
+			ring[#ring + 1] = w
+			break
+		end
+	end
+	for _, w in ipairs(vim.api.nvim_list_wins()) do -- then each Loupe input surface
+		if is_surface(w) and vim.bo[vim.api.nvim_win_get_buf(w)].buftype == "prompt" then
+			ring[#ring + 1] = w
+		end
+	end
+	if #ring < 2 then
+		vim.notify("Loupe: nothing to switch to")
+		return
+	end
+	local cur = vim.api.nvim_get_current_win()
+	local idx = 1
+	for i, w in ipairs(ring) do
+		if w == cur then
+			idx = i
+			break
+		end
+	end
+	local nxt = ring[(idx % #ring) + 1]
+	vim.cmd("stopinsert")
+	vim.api.nvim_set_current_win(nxt)
+	if vim.bo[vim.api.nvim_win_get_buf(nxt)].buftype == "prompt" then
+		vim.cmd("startinsert")
+	end
+end
+
+-- Close all open Loupe surfaces at once (clear the screen).
+function M.close_surfaces()
+	for _, w in ipairs(vim.api.nvim_list_wins()) do
+		if is_surface(w) and vim.api.nvim_win_is_valid(w) then
+			pcall(vim.api.nvim_win_close, w, true)
+		end
+	end
+	M._close_chat = nil
 end
 
 function M.hello()
