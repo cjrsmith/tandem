@@ -1,0 +1,277 @@
+// Loupe persistent sidecar (daemon).
+// Boots ONE OpenCode server and stays alive, handling many prompts across many
+// sessions over stdin/stdout. This is what gives the bubble real memory: a
+// session id can be reused, so its conversation history accumulates.
+//
+// stdin — one JSON command per line:
+//   {"cmd":"prompt","tag":"t1","session":null,"text":"hi"}        // new session
+//   {"cmd":"prompt","tag":"t2","session":"ses_x","text":"..."}    // continue session
+//   {"cmd":"shutdown"}
+//
+// stdout — one JSON event per line, each carrying the originating request's tag:
+//   {"type":"ready"}                              // daemon booted, send commands
+//   {"tag":"t1","type":"session","id":"ses_x"}    // the session this turn uses
+//   {"tag":"t1","type":"delta","text":"..."}      // a streamed chunk of the reply
+//   {"tag":"t1","type":"done"}                    // turn finished
+//   {"tag":"t1","type":"error","error":{...}}
+import { createOpencode } from "@opencode-ai/sdk";
+import readline from "node:readline";
+import http from "node:http";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+const MODEL = { providerID: "opencode", modelID: "north-mini-code-free" };
+const VERSION = "2026-06-30 region edits";
+
+// loupe_region: replace just the region the user selected/marked. Returns ONLY that
+// region's code (not the whole file) — Loupe places it between the marks while the
+// user can keep editing elsewhere. Posts to the same bridge as loupe_write.
+const LOUPE_REGION_TOOL = `import { tool } from "@opencode-ai/plugin"
+
+export default tool({
+  description: "Replace the region of code the user has selected/marked in their editor. Return ONLY the replacement code for that region — NOT the whole file. Use this whenever the user asks you to implement, fill in, or change a selected region.",
+  args: {
+    code: tool.schema.string().describe("The replacement code for the selected region only"),
+  },
+  async execute(args) {
+    const port = process.env.LOUPE_BRIDGE_PORT
+    if (!port) return "loupe_region is only available inside the Loupe editor."
+    const res = await fetch("http://127.0.0.1:" + port + "/region", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code: args.code }),
+    })
+    const out = await res.json().catch(() => ({}))
+    return out.message || "applied"
+  },
+})
+`;
+
+// The loupe_write tool source. Deployed (below) into a Loupe-owned opencode config
+// dir so the model can call it in ANY project. Instead of writing to disk, it POSTs
+// the edit to the daemon's bridge, which relays to Neovim's typewriter. The `await
+// fetch` blocks until Neovim is done — the suspension point for interrupt/resume.
+const LOUPE_WRITE_TOOL = `import { tool } from "@opencode-ai/plugin"
+
+export default tool({
+  description: "Write code into the user's editor through Loupe. The ONLY way to create or modify a file; the human watches it typed in and can interrupt. Only works inside the Loupe Neovim plugin.",
+  args: {
+    file: tool.schema.string().describe("Path of the file to create or edit"),
+    content: tool.schema.string().describe("The complete new contents of the file"),
+  },
+  async execute(args) {
+    const port = process.env.LOUPE_BRIDGE_PORT
+    if (!port) return "loupe_write is only available inside the Loupe editor; use the normal edit tools instead."
+    const res = await fetch("http://127.0.0.1:" + port + "/edit", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: args.file, content: args.content }),
+    })
+    const out = await res.json().catch(() => ({}))
+    return out.message || "applied"
+  },
+})
+`;
+
+// The structured-output contract (§3.13). Makes the model mark code meant for the
+// file so Loupe can route it (e.g. to ghost text) instead of leaving it as prose.
+const SYSTEM = [
+  "You are assisting inside a code editor; the user reads your reply in a small chat bubble.",
+  "When part of your answer is concrete code the user could insert into their current file,",
+  "wrap ONLY that code in <loupe:suggest> and </loupe:suggest> tags, each tag on its own line.",
+  "Keep ALL explanation as normal prose OUTSIDE the tags.",
+  "Do NOT tag tiny inline snippets that are part of a sentence — only standalone code blocks meant for the file.",
+].join("\n");
+
+function send(obj) {
+  process.stdout.write(JSON.stringify(obj) + "\n");
+}
+function debug(...a) {
+  if (process.env.LOUPE_DEBUG) process.stderr.write(a.map(String).join(" ") + "\n");
+}
+
+// ── loupe_write deployment + edit bridge (must precede createOpencode) ──
+// Deploy the tool into a Loupe-OWNED config dir; OPENCODE_CONFIG_DIR keeps the
+// user's model auth working (verified) without touching project/global config.
+const LOUPE_CFG_DIR = path.join(os.homedir(), ".cache", "loupe", "opencode");
+fs.mkdirSync(path.join(LOUPE_CFG_DIR, "tools"), { recursive: true });
+fs.writeFileSync(path.join(LOUPE_CFG_DIR, "tools", "loupe_write.js"), LOUPE_WRITE_TOOL);
+fs.writeFileSync(path.join(LOUPE_CFG_DIR, "tools", "loupe_region.js"), LOUPE_REGION_TOOL);
+process.env.OPENCODE_CONFIG_DIR = LOUPE_CFG_DIR;
+
+const pendingEdits = new Map(); // editID -> pending http response (the blocked tool)
+let editN = 0;
+function takeBody(req, res, fn) {
+  let body = "";
+  req.on("data", (c) => (body += c));
+  req.on("end", () => {
+    let e = {};
+    try { e = JSON.parse(body || "{}"); } catch {}
+    const id = "e" + ++editN;
+    pendingEdits.set(id, res);
+    fn(id, e);
+  });
+}
+const bridge = http.createServer((req, res) => {
+  if (req.method === "POST" && req.url === "/edit") {
+    takeBody(req, res, (id, e) => send({ type: "edit", id, file: e.file, content: e.content }));
+  } else if (req.method === "POST" && req.url === "/region") {
+    takeBody(req, res, (id, e) => send({ type: "region", id, content: e.code }));
+  } else {
+    res.writeHead(404);
+    res.end();
+  }
+});
+await new Promise((r) => bridge.listen(0, "127.0.0.1", r));
+process.env.LOUPE_BRIDGE_PORT = String(bridge.address().port);
+debug("loupe bridge on", bridge.address().port);
+
+const { client, server } = await createOpencode({ port: 0 });
+debug("daemon up at", server.url);
+function shutdown(code) {
+  try { bridge.close(); } catch {}
+  try { server.close(); } catch {}
+  process.exit(code);
+}
+process.on("SIGTERM", () => shutdown(0));
+process.on("SIGINT", () => shutdown(0));
+
+// One global event stream for the whole server; route each event to the request
+// that owns its session. `active` maps a sessionID to the request currently
+// streaming from it.
+const active = new Map(); // sessionID -> { tag }
+const partType = new Map(); // partID -> "text" | "reasoning" | ... (to filter reasoning)
+let lastStatus = ""; // dedupe the one-line status we push to the editor
+
+// A concise "what the AI is doing now" label from a tool call (falls back when
+// OpenCode doesn't supply its own title).
+function toolLabel(tool, input = {}) {
+  const base = (s) => (typeof s === "string" && s ? s.split("/").pop() : "");
+  switch (tool) {
+    case "read": return "reading " + (base(input.filePath || input.path) || "a file");
+    case "write": case "edit": case "apply_patch": case "loupe_write":
+      return "writing " + (base(input.file || input.filePath) || "a file");
+    case "bash": return "running: " + String(input.command || input.description || "command").replace(/\s+/g, " ").slice(0, 40);
+    case "grep": return "searching" + (input.pattern ? ' "' + String(input.pattern).slice(0, 24) + '"' : "");
+    case "glob": case "list": return "finding files";
+    case "webfetch": return "fetching " + (base(input.url) || "");
+    case "task": return "delegating a subtask";
+    default: return String(tool).replace(/_/g, " ");
+  }
+}
+
+const events = await client.event.subscribe();
+(async () => {
+  for await (const event of events.stream) {
+    const p = event.properties || {};
+    const req = active.get(p.sessionID);
+    if (!req) continue;
+    if (event.type === "message.part.updated" && p.part) {
+      const part = p.part;
+      partType.set(part.id, part.type); // learn each part's type
+      // Surface what the AI is doing as a one-line status (global; the editor shows
+      // it in the activity indicator). Deduped so we don't spam identical lines.
+      let label = null;
+      if (part.type === "tool" && part.state && (part.state.status === "running" || part.state.status === "pending")) {
+        label = part.state.title || toolLabel(part.tool, part.state.input);
+      } else if (part.type === "reasoning") {
+        label = "thinking…";
+      }
+      if (label && label !== lastStatus) {
+        lastStatus = label;
+        send({ type: "status", label });
+      }
+    } else if (event.type === "message.part.delta" && p.field === "text" && p.delta) {
+      // Drop the model's "thinking" — only stream actual answer (text) parts.
+      if (partType.get(p.partID) !== "reasoning") {
+        send({ tag: req.tag, type: "delta", text: p.delta });
+      }
+    } else if (event.type === "session.idle") {
+      lastStatus = ""; // reset so the next turn re-emits its status
+      send({ tag: req.tag, type: "done" });
+      active.delete(p.sessionID);
+    } else if (event.type === "session.error") {
+      send({ tag: req.tag, type: "error", error: p });
+      active.delete(p.sessionID);
+    }
+  }
+})().catch((e) => debug("event loop error", e));
+
+async function handlePrompt(cmd) {
+  let sid = cmd.session;
+  if (cmd.fork && sid) {
+    // Fork: a new session that inherits the parent's history, then diverges —
+    // a context-preserving side thread that won't pollute the original.
+    const forked = await client.session.fork({ path: { id: sid } });
+    sid = forked.data.id;
+  } else if (!sid) {
+    const created = await client.session.create({ body: {} });
+    sid = created.data.id; // a fresh session = fresh memory
+  }
+  active.set(sid, { tag: cmd.tag });
+  send({ tag: cmd.tag, type: "session", id: sid });
+  // Reusing `sid` here is the whole point: the session keeps its history.
+  // Default to the read-only `plan` agent so a chat turn never edits files;
+  // edit-capable agents (e.g. "build") are opt-in via cmd.agent later (§3.13).
+  await client.session.promptAsync({
+    path: { id: sid },
+    body: {
+      model: cmd.model || MODEL,
+      agent: cmd.agent || "plan",
+      system: cmd.system || SYSTEM, // Neovim assembles a per-role system from agent files
+      tools: cmd.tools, // per-role gating, e.g. Driver: { write:false, edit:false, patch:false }
+      parts: [{ type: "text", text: cmd.text }],
+    },
+  });
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  line = line.trim();
+  if (!line) return;
+  let cmd;
+  try { cmd = JSON.parse(line); } catch { return; }
+  if (cmd.cmd === "prompt") {
+    handlePrompt(cmd).catch((e) => send({ tag: cmd.tag, type: "error", error: String(e) }));
+  } else if (cmd.cmd === "cancel" && cmd.session) {
+    // Abort the running turn for this session (the user hit cancel).
+    client.session.abort({ path: { id: cmd.session } }).catch((e) => debug("abort error", e));
+  } else if (cmd.cmd === "cancel_all") {
+    // Abort every running turn (global cancel).
+    for (const sid of active.keys()) {
+      client.session.abort({ path: { id: sid } }).catch((e) => debug("abort error", e));
+    }
+  } else if (cmd.cmd === "history" && cmd.session) {
+    // Return the session's prior messages (role + concatenated text parts).
+    client.session
+      .messages({ path: { id: cmd.session } })
+      .then((res) => {
+        const msgs = (res.data || [])
+          .map((m) => ({
+            role: m.info?.role || "?",
+            text: (m.parts || [])
+              .filter((p) => p.type === "text" && p.text)
+              .map((p) => p.text)
+              .join(""),
+          }))
+          .filter((m) => m.text.trim() !== "");
+        send({ tag: cmd.tag, type: "history", messages: msgs });
+      })
+      .catch((e) => send({ tag: cmd.tag, type: "error", error: String(e) }));
+  } else if (cmd.cmd === "edit_done") {
+    // Neovim finished applying an edit; unblock the loupe_write tool that's waiting.
+    const res = pendingEdits.get(cmd.id);
+    if (res) {
+      pendingEdits.delete(cmd.id);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ message: cmd.message || "applied" }));
+    }
+  } else if (cmd.cmd === "shutdown") {
+    shutdown(0);
+  }
+});
+
+// Tell the client we're ready to accept commands.
+send({ type: "ready", version: VERSION });
+debug("listening on stdin");

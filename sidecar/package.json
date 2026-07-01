@@ -1,0 +1,9 @@
+{
+  "name": "loupe-sidecar",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.17.9"
+  }
+}
