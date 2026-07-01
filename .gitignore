@@ -4,5 +4,3 @@ node_modules/
 # sidecar logs
 *.log
 
-# scratch test file (not part of the plugin)
-lua/loupe/test.lua
