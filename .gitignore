@@ -4,3 +4,6 @@ node_modules/
 # sidecar logs
 *.log
 
+# per-project runtime state (workpackage manifest, journals, backlog, sessions)
+.loupe/
+

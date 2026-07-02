@@ -43,26 +43,44 @@ end
 M.active_session = nil -- the current working session, shared across bubbles
 M.active_edit = nil -- { buf, srow, erow } — where the AI is currently writing code
 
--- Available models for the picker; M.active_model is what new prompts use.
+-- Available models for the picker; M.active_model is what new prompts use. Each
+-- model names its `backend` — the daemon routes on it (opencode vs the Claude
+-- Agent SDK). Selecting a Claude model IS how you switch backends; the rail shows
+-- the active one. Claude models need ANTHROPIC_API_KEY in the daemon's env.
 M.models = {
-	{ label = "GPT-5.5", providerID = "openai", modelID = "gpt-5.5" },
-	{ label = "GPT-5.5 fast", providerID = "openai", modelID = "gpt-5.5-fast" },
-	{ label = "GPT-5.4 mini", providerID = "openai", modelID = "gpt-5.4-mini" },
-	{ label = "zen free", providerID = "opencode", modelID = "north-mini-code-free" },
+	{ label = "GPT-5.5", backend = "opencode", providerID = "openai", modelID = "gpt-5.5" },
+	{ label = "GPT-5.5 fast", backend = "opencode", providerID = "openai", modelID = "gpt-5.5-fast" },
+	{ label = "GPT-5.4 mini", backend = "opencode", providerID = "openai", modelID = "gpt-5.4-mini" },
+	{ label = "zen free", backend = "opencode", providerID = "opencode", modelID = "north-mini-code-free" },
+	{ label = "Claude Opus 4.8", backend = "claude", providerID = "anthropic", modelID = "claude-opus-4-8" },
+	{ label = "Claude Sonnet 4.6", backend = "claude", providerID = "anthropic", modelID = "claude-sonnet-4-6" },
+	{ label = "Claude Haiku 4.5", backend = "claude", providerID = "anthropic", modelID = "claude-haiku-4-5-20251001" },
 }
 M.active_model = M.models[1] -- default: GPT-5.5 (clean output, follows instructions)
 
--- Pick the active model; subsequent prompts use it.
+-- The active backend, derived from the selected model (defaults to opencode).
+function M.backend()
+	return (M.active_model and M.active_model.backend) or "opencode"
+end
+
+-- Pick the active model; subsequent prompts use it. Crossing backends is allowed
+-- (it just means the next session runs on the other backend).
 function M.pick_model()
 	vim.ui.select(M.models, {
 		prompt = "Loupe model:",
 		format_item = function(m)
-			return m.label .. "  (" .. m.providerID .. "/" .. m.modelID .. ")"
+			return m.label .. "  (" .. (m.backend or "opencode") .. ")"
 		end,
 	}, function(choice)
 		if choice then
+			local switched = M.backend() ~= choice.backend
 			M.active_model = choice
-			vim.notify("Loupe model → " .. choice.label)
+			if switched then
+				-- crossing backends: load THIS backend's session for the active workpackage
+				M._usage = nil
+				pcall(M.wp_load)
+			end
+			vim.notify("Loupe model → " .. choice.label .. (switched and ("  [" .. choice.backend .. "]") or ""))
 			M.rail_refresh()
 		end
 	end)
@@ -1542,7 +1560,7 @@ end
 
 function M.cancel(session)
 	if session then
-		send_cmd({ cmd = "cancel", session = session })
+		send_cmd({ cmd = "cancel", session = session, backend = M.backend() })
 	end
 end
 
@@ -1587,6 +1605,7 @@ function M.prompt(session, text, on_event, fork, opts)
 		session = session,
 		text = text,
 		fork = fork,
+		backend = M.backend(),
 		model = M.active_model and { providerID = M.active_model.providerID, modelID = M.active_model.modelID } or nil,
 		system = opts.system or M.build_system(), -- per-role behaviour from the agent files
 		agent = opts.agent or (({ navigator = "plan", neutral = "build", driver = "build" })[M.role] or "build"),
@@ -1614,7 +1633,7 @@ function M.fetch_history(session, cb)
 			cb({})
 		end
 	end
-	send_cmd({ cmd = "history", tag = tag, session = session })
+	send_cmd({ cmd = "history", tag = tag, session = session, backend = M.backend() })
 end
 
 -- Fetch token/cost usage for a session; caches into M._usage and refreshes the rail.
@@ -1645,7 +1664,7 @@ function M.fetch_usage(session, cb)
 			end
 		end
 	end
-	send_cmd({ cmd = "usage", tag = tag, session = session })
+	send_cmd({ cmd = "usage", tag = tag, session = session, backend = M.backend() })
 end
 
 -- Compact (summarize) the active session so its context shrinks. Fire-and-forget with a toast.
@@ -1668,7 +1687,7 @@ function M.compact()
 			M.toast("Compaction failed: " .. tostring(msg.error))
 		end
 	end
-	send_cmd({ cmd = "compact", tag = tag, session = session })
+	send_cmd({ cmd = "compact", tag = tag, session = session, backend = M.backend() })
 end
 
 -- ── Workpackages (named session + journal + backlog) ────────────
@@ -1720,21 +1739,42 @@ function M.wp_active()
 	return m.active
 end
 
--- Point M.active_session at the active workpackage's stored session (call at startup).
-function M.wp_load()
-	local m = wp_manifest()
-	local name = M.wp_active()
-	M.active_session = m.packages[name] and m.packages[name].session or nil
-	M.rail_refresh()
-end
-
--- Set the working session AND persist it onto the active workpackage.
-function M.set_active_session(id)
-	M.active_session = id
+-- Sessions are stored PER BACKEND on each workpackage: an opencode session id and
+-- a Claude session id can't be resumed by the other backend, so we keep them apart
+-- (`pkg.sessions = { opencode=…, claude=… }`) and surface whichever matches the
+-- active backend. Legacy manifests with a single `pkg.session` migrate into the
+-- opencode slot on first touch.
+local function wp_pkg()
 	local m = wp_manifest()
 	local name = M.wp_active()
 	m.packages[name] = m.packages[name] or {}
-	m.packages[name].session = id
+	local pkg = m.packages[name]
+	pkg.sessions = pkg.sessions or {}
+	if pkg.session and not pkg.sessions.opencode then
+		pkg.sessions.opencode = pkg.session -- migrate legacy single-session field
+	end
+	return m, pkg
+end
+
+-- The active workpackage's stored session for the CURRENT backend (or nil = fresh).
+function M.wp_session()
+	local _, pkg = wp_pkg()
+	return pkg.sessions[M.backend()]
+end
+
+-- Point M.active_session at the active workpackage's stored session (call at startup,
+-- and whenever the backend changes).
+function M.wp_load()
+	M.active_session = M.wp_session()
+	M.rail_refresh()
+end
+
+-- Set the working session AND persist it onto the active workpackage (under the
+-- current backend's slot).
+function M.set_active_session(id)
+	M.active_session = id
+	local m, pkg = wp_pkg()
+	pkg.sessions[M.backend()] = id
 	wp_write_manifest(m)
 end
 
@@ -1746,7 +1786,8 @@ function M.wp_switch_to(name)
 	end
 	m.active = name
 	wp_write_manifest(m)
-	M.active_session = m.packages[name].session
+	M.active_session = M.wp_session()
+	M._usage = nil
 	M.rail_refresh()
 	vim.notify("Loupe workpackage → " .. name)
 end
@@ -1762,7 +1803,8 @@ function M.wp_create(name)
 	m.active = name
 	wp_write_manifest(m)
 	vim.fn.mkdir(wp_dir(name), "p")
-	M.active_session = m.packages[name].session -- nil = fresh
+	M.active_session = M.wp_session() -- nil = fresh
+	M._usage = nil
 	M.rail_refresh()
 	vim.notify("Loupe workpackage → " .. name)
 end
@@ -2404,6 +2446,7 @@ function M.render_rail(buf, todo)
 	lines[#lines + 1] = "  Coach    " .. (M.coach and "on" or "off")
 	lines[#lines + 1] = "  Follow   " .. (M.follow and "on" or "off")
 	lines[#lines + 1] = "  Model    " .. (M.active_model and M.active_model.label or "?")
+	lines[#lines + 1] = "  Backend  " .. M.backend()
 	lines[#lines + 1] = "  Pace     " .. M.granularity
 	lines[#lines + 1] = "  Package  " .. (pcall(M.wp_active) and M.wp_active() or "default")
 	lines[#lines + 1] = "  Session  " .. sid()

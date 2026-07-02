@@ -22,7 +22,7 @@ import os from "node:os";
 import path from "node:path";
 
 const MODEL = { providerID: "opencode", modelID: "north-mini-code-free" };
-const VERSION = "2026-07-02 usage+compact";
+const VERSION = "2026-07-02 usage+compact+claude-backend";
 
 // loupe_instruct: the Navigator gives the human ONE directive (a next step). Sticky,
 // non-blocking — shown in the notification bar until dismissed / next asked.
@@ -319,22 +319,50 @@ async function handlePrompt(cmd) {
   });
 }
 
+// The Claude backend (Agent SDK) is loaded lazily the first time a command asks
+// for it, so the OpenCode path never pays for it and a missing API key only bites
+// when Claude is actually selected. It speaks the same event protocol as above.
+let claudeBackend = null;
+async function getClaude() {
+  if (!claudeBackend) {
+    const { createClaudeBackend } = await import("./backends/claude.mjs");
+    claudeBackend = createClaudeBackend({ send, cwd: process.cwd(), defaultSystem: SYSTEM });
+  }
+  return claudeBackend;
+}
+
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   line = line.trim();
   if (!line) return;
   let cmd;
   try { cmd = JSON.parse(line); } catch { return; }
+  const claude = cmd.backend === "claude"; // route session-scoped commands per backend
   if (cmd.cmd === "prompt") {
-    handlePrompt(cmd).catch((e) => send({ tag: cmd.tag, type: "error", error: String(e) }));
+    if (claude) {
+      getClaude().then((b) => b.handlePrompt(cmd)).catch((e) => send({ tag: cmd.tag, type: "error", error: String(e) }));
+    } else {
+      handlePrompt(cmd).catch((e) => send({ tag: cmd.tag, type: "error", error: String(e) }));
+    }
   } else if (cmd.cmd === "cancel" && cmd.session) {
     // Abort the running turn for this session (the user hit cancel).
-    client.session.abort({ path: { id: cmd.session } }).catch((e) => debug("abort error", e));
+    if (claude) {
+      getClaude().then((b) => b.cancel(cmd.session)).catch((e) => debug("abort error", e));
+    } else {
+      client.session.abort({ path: { id: cmd.session } }).catch((e) => debug("abort error", e));
+    }
   } else if (cmd.cmd === "cancel_all") {
-    // Abort every running turn (global cancel).
+    // Abort every running turn (global cancel) across both backends.
     for (const sid of active.keys()) {
       client.session.abort({ path: { id: sid } }).catch((e) => debug("abort error", e));
     }
+    if (claudeBackend) claudeBackend.cancelAll();
+  } else if (cmd.cmd === "history" && cmd.session && claude) {
+    getClaude().then((b) => b.history(cmd)).catch((e) => send({ tag: cmd.tag, type: "error", error: String(e) }));
+  } else if (cmd.cmd === "usage" && cmd.session && claude) {
+    getClaude().then((b) => b.usage(cmd)).catch((e) => send({ tag: cmd.tag, type: "usage", error: String(e) }));
+  } else if (cmd.cmd === "compact" && cmd.session && claude) {
+    getClaude().then((b) => b.compact(cmd)).catch((e) => send({ tag: cmd.tag, type: "error", error: String(e) }));
   } else if (cmd.cmd === "history" && cmd.session) {
     // Return the session's prior messages (role + concatenated text parts).
     client.session
