@@ -77,12 +77,39 @@ const loupeServer = createSdkMcpServer({
         return textResult("shown");
       },
     ),
+    tool(
+      "loupe_journal",
+      "Curate this workpackage's JOURNAL — a concise, always-current brief (goal, current state, key decisions, approach) injected into every session here. Pass the COMPLETE updated markdown; it replaces the old one. Keep it tight; update as decisions are made.",
+      { content: z.string().describe("The complete updated journal markdown (a concise brief)") },
+      async (a) => {
+        await bridge("/journal", { content: a.content });
+        return textResult("journal updated");
+      },
+    ),
+    tool(
+      "loupe_backlog",
+      "Update this workpackage's BACKLOG: add new concrete tasks and/or mark finished ones done. Does NOT rewrite the list, so the human's ordering is preserved.",
+      {
+        add: z.array(z.string()).optional().describe("New tasks to append (highest priority first)"),
+        complete: z.array(z.string()).optional().describe("Texts of existing tasks to mark done"),
+      },
+      async (a) => {
+        await bridge("/backlog", { add: a.add || [], complete: a.complete || [] });
+        return textResult("backlog updated");
+      },
+    ),
   ],
 });
 
-const LOUPE_TOOLS = ["loupe_write", "loupe_region", "loupe_ask", "loupe_notify", "loupe_instruct"].map(
-  (t) => "mcp__loupe__" + t,
-);
+const LOUPE_TOOLS = [
+  "loupe_write",
+  "loupe_region",
+  "loupe_ask",
+  "loupe_notify",
+  "loupe_instruct",
+  "loupe_journal",
+  "loupe_backlog",
+].map((t) => "mcp__loupe__" + t);
 const WRITE_TOOLS = ["mcp__loupe__loupe_write", "mcp__loupe__loupe_region"];
 const NATIVE_WRITERS = ["Write", "Edit", "MultiEdit", "NotebookEdit"];
 

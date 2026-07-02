@@ -1096,6 +1096,10 @@ local function on_stdout(_, data)
 					M.on_notify(msg) -- the agent's loupe_notify tool — a status line
 				elseif msg.type == "instruct" then
 					M.on_instruct(msg) -- the Navigator's loupe_instruct tool — a directive
+				elseif msg.type == "journal" then
+					M.on_journal(msg) -- loupe_journal tool — curate the workpackage brief
+				elseif msg.type == "backlog" then
+					M.on_backlog(msg) -- loupe_backlog tool — add/complete tasks
 				elseif msg.type == "status" then
 					M.on_status(msg) -- one-line "what the AI is doing now"
 				elseif daemon.handlers[msg.tag] then
@@ -1999,6 +2003,7 @@ function M.wp_load()
 	if e then
 		M._restore_backend(e.backend)
 	end
+	pcall(M.ensure_journal) -- make sure the active workpackage has a journal doc
 	M.rail_refresh()
 end
 
@@ -2047,6 +2052,7 @@ function M.wp_create(name)
 	m.active = { wp = name, key = key }
 	wp_write_manifest(m)
 	vim.fn.mkdir(wp_dir(name), "p")
+	pcall(M.ensure_journal, name) -- born with a journal to grow
 	M.active_session = nil
 	M._usage = nil
 	M.rail_refresh()
@@ -2223,6 +2229,122 @@ function M.journal_note()
 			M.journal_append(note)
 		end
 	end)
+end
+
+-- Write `lines` to `path`, updating any OPEN buffer for it too (so the AI writing
+-- the journal/backlog doesn't silently diverge from a copy you have open — the same
+-- hazard as on_edit). Creates the dir as needed.
+local function write_doc(path, lines)
+	vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
+	local buf = vim.fn.bufadd(path)
+	vim.fn.bufload(buf)
+	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+	pcall(function()
+		vim.api.nvim_buf_call(buf, function()
+			vim.cmd("silent keepalt noautocmd write")
+		end)
+	end)
+end
+
+-- The default journal template (the living-brief sections the AI curates).
+function M.journal_template()
+	return { "# Journal", "", "## Goal", "", "## Current state", "", "## Key decisions", "", "## Approach & constraints", "" }
+end
+
+-- Seed a workpackage's journal with the template if it doesn't exist yet (called when
+-- a workpackage is created / adopted, so there's structure for the AI + you to grow).
+function M.ensure_journal(name)
+	local path = M.wp_journal_path(name)
+	if vim.fn.filereadable(path) == 0 then
+		vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
+		vim.fn.writefile(M.journal_template(), path)
+	end
+end
+
+-- The agent's loupe_journal tool: REPLACE the workpackage journal with a freshly
+-- curated brief (the AI keeps it concise — goal / state / decisions / approach).
+function M.on_journal(msg)
+	local content = msg.content or ""
+	if vim.trim(content) == "" then
+		return
+	end
+	write_doc(M.wp_journal_path(), vim.split(content, "\n", { plain = true }))
+	M.toast("✎ journal updated — <leader>lj to view")
+end
+
+-- Mark backlog items done by matching their text (used by loupe_backlog complete).
+function M.backlog_complete(texts)
+	local path = M.wp_backlog_path()
+	if vim.fn.filereadable(path) == 0 then
+		return
+	end
+	local want = {}
+	for _, t in ipairs(texts or {}) do
+		want[vim.trim(t):lower()] = true
+	end
+	local lines = vim.fn.readfile(path)
+	for i, l in ipairs(lines) do
+		local text = l:match("^%s*%- %[ %]%s*(.*)$")
+		if text and want[vim.trim(text):lower()] then
+			lines[i] = (l:gsub("%[ %]", "[x]", 1))
+		end
+	end
+	write_doc(path, lines)
+	M.rail_refresh()
+end
+
+-- The agent's loupe_backlog tool: add new tasks and/or tick off finished ones. We
+-- never rewrite the whole list (so your ordering + manual edits are preserved).
+function M.on_backlog(msg)
+	if msg.add then
+		for _, t in ipairs(msg.add) do
+			M.backlog_add(t)
+		end
+	end
+	if msg.complete then
+		M.backlog_complete(msg.complete)
+	end
+	M.toast("✎ backlog updated")
+end
+
+-- View the active workpackage's journal in an editable markdown float.
+function M.view_journal()
+	local path = M.wp_journal_path()
+	if vim.fn.filereadable(path) == 0 then
+		write_doc(path, M.journal_template())
+	end
+	local W = math.floor(vim.o.columns * 0.6)
+	local H = math.floor(vim.o.lines * 0.7)
+	local buf = vim.fn.bufadd(path)
+	vim.fn.bufload(buf)
+	vim.bo[buf].filetype = "markdown"
+	local win = vim.api.nvim_open_win(buf, true, {
+		relative = "editor", row = math.floor((vim.o.lines - H) / 2), col = math.floor((vim.o.columns - W) / 2),
+		width = W, height = H, style = "minimal", border = "rounded",
+		title = " journal · " .. M.wp_active() .. " · q saves ",
+		title_pos = "center",
+	})
+	vim.wo[win].wrap, vim.wo[win].linebreak, vim.wo[win].conceallevel = true, true, 2
+	vim.wo[win].winhighlight = "FloatBorder:LoupeBorderActive"
+	vim.keymap.set("n", "q", function()
+		pcall(function() vim.cmd("silent keepalt noautocmd write") end)
+		pcall(vim.api.nvim_win_close, win, true)
+	end, { buffer = buf })
+end
+
+-- Explicit trigger: ask the current session to update the journal + backlog from the
+-- conversation so far (the "capture plan" escape hatch — the AI also does this
+-- ambiently per the agent files, but you can always force it).
+function M.capture_plan()
+	if not M.active_session then
+		vim.notify("Loupe: no active session to capture from")
+		return
+	end
+	M.toast("✎ capturing our plan into the journal + backlog…")
+	M.run(
+		M.active_session,
+		"Based on our conversation so far, curate this workpackage's shared memory: call loupe_journal with a concise, up-to-date brief (goal, current state, key decisions, approach & constraints), and call loupe_backlog to add any concrete tasks we've identified. Keep the journal tight — it's injected into every session."
+	)
 end
 
 -- ── @-references (pull files into a prompt) ─────────────────────
@@ -2725,6 +2847,8 @@ function M.settings_menu()
 		{ label = "Compact conversation", run = M.compact },
 		{ label = "New workpackage", run = M.wp_new },
 		{ label = "Rename workpackage", run = M.wp_rename },
+		{ label = "View journal", run = M.view_journal },
+		{ label = "Capture plan → journal + backlog (AI)", run = M.capture_plan },
 		{ label = "Open backlog", run = M.backlog },
 		{ label = "Plan backlog (AI)", run = M.plan },
 	}

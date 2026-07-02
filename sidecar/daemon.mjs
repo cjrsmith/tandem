@@ -22,7 +22,7 @@ import os from "node:os";
 import path from "node:path";
 
 const MODEL = { providerID: "opencode", modelID: "north-mini-code-free" };
-const VERSION = "2026-07-02 usage+compact+claude-backend";
+const VERSION = "2026-07-02 usage+compact+claude-backend+journal";
 
 // loupe_instruct: the Navigator gives the human ONE directive (a next step). Sticky,
 // non-blocking — shown in the notification bar until dismissed / next asked.
@@ -42,6 +42,51 @@ export default tool({
       body: JSON.stringify({ instruction: args.instruction }),
     })
     return "shown"
+  },
+})
+`;
+
+// loupe_journal: curate the workpackage's shared JOURNAL (a concise living brief —
+// goal, current state, key decisions, approach). Replaces the journal with the given
+// markdown. The journal is injected into every session in this workpackage, so keep it
+// tight. loupe_backlog: add tasks and/or tick off finished ones.
+const LOUPE_JOURNAL_TOOL = `import { tool } from "@opencode-ai/plugin"
+
+export default tool({
+  description: "Curate this workpackage's JOURNAL — a concise, always-current brief (goal, current state, key decisions, approach & constraints) that is injected into every session here. Pass the COMPLETE updated journal markdown; it replaces the old one. Keep it tight: capture decisions and context, not a play-by-play. Update it as decisions are made or the state changes.",
+  args: {
+    content: tool.schema.string().describe("The complete updated journal markdown (a concise brief)"),
+  },
+  async execute(args) {
+    const port = process.env.LOUPE_BRIDGE_PORT
+    if (!port) return "loupe_journal is only available inside the Loupe editor."
+    await fetch("http://127.0.0.1:" + port + "/journal", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ content: args.content }),
+    })
+    return "journal updated"
+  },
+})
+`;
+
+const LOUPE_BACKLOG_TOOL = `import { tool } from "@opencode-ai/plugin"
+
+export default tool({
+  description: "Update this workpackage's BACKLOG: add new concrete tasks and/or mark finished ones done. Does NOT rewrite the list, so the human's ordering and edits are preserved. Add tasks as you identify them from planning; tick items off as you complete them.",
+  args: {
+    add: tool.schema.array(tool.schema.string()).optional().describe("New tasks to append (highest priority first)"),
+    complete: tool.schema.array(tool.schema.string()).optional().describe("Texts of existing tasks to mark done (matched by text)"),
+  },
+  async execute(args) {
+    const port = process.env.LOUPE_BRIDGE_PORT
+    if (!port) return "loupe_backlog is only available inside the Loupe editor."
+    await fetch("http://127.0.0.1:" + port + "/backlog", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ add: args.add || [], complete: args.complete || [] }),
+    })
+    return "backlog updated"
   },
 })
 `;
@@ -167,6 +212,8 @@ fs.writeFileSync(path.join(LOUPE_CFG_DIR, "tools", "loupe_region.js"), LOUPE_REG
 fs.writeFileSync(path.join(LOUPE_CFG_DIR, "tools", "loupe_ask.js"), LOUPE_ASK_TOOL);
 fs.writeFileSync(path.join(LOUPE_CFG_DIR, "tools", "loupe_notify.js"), LOUPE_NOTIFY_TOOL);
 fs.writeFileSync(path.join(LOUPE_CFG_DIR, "tools", "loupe_instruct.js"), LOUPE_INSTRUCT_TOOL);
+fs.writeFileSync(path.join(LOUPE_CFG_DIR, "tools", "loupe_journal.js"), LOUPE_JOURNAL_TOOL);
+fs.writeFileSync(path.join(LOUPE_CFG_DIR, "tools", "loupe_backlog.js"), LOUPE_BACKLOG_TOOL);
 process.env.OPENCODE_CONFIG_DIR = LOUPE_CFG_DIR;
 
 const pendingEdits = new Map(); // editID -> pending http response (the blocked tool)
@@ -200,6 +247,28 @@ const bridge = http.createServer((req, res) => {
       send({ type: "notify", message: e.message });
       res.writeHead(200, { "content-type": "application/json" });
       res.end('{"message":"shown"}');
+    });
+  } else if (req.method === "POST" && req.url === "/journal") {
+    // fire-and-forget: Neovim writes the workpackage journal
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      let e = {};
+      try { e = JSON.parse(body || "{}"); } catch {}
+      send({ type: "journal", content: e.content });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"message":"journal updated"}');
+    });
+  } else if (req.method === "POST" && req.url === "/backlog") {
+    // fire-and-forget: Neovim adds/completes backlog tasks
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      let e = {};
+      try { e = JSON.parse(body || "{}"); } catch {}
+      send({ type: "backlog", add: e.add, complete: e.complete });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"message":"backlog updated"}');
     });
   } else if (req.method === "POST" && req.url === "/instruct") {
     let body = "";
