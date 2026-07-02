@@ -1166,44 +1166,56 @@ end
 
 -- Serialize concurrent edits: the typewriter is single-stream, so when the agent
 -- issues several writes/regions in one turn (parallel tool calls), we run them ONE
--- AT A TIME in arrival order. A busy edit holds the others in `M._edit_queue`; each
--- finishing edit pumps the next. Each queued tool stays blocked (no edit_done) until
--- its turn, so the agent's own ordering is preserved and nothing clobbers anything.
+-- AT A TIME in arrival order. `M._edit_busy` is claimed by the FIRST edit and held
+-- until the queue fully drains — so an edit arriving in the gap between one finishing
+-- and the next starting (the agent fires its next loupe_write the instant it gets
+-- edit_done) still queues behind, instead of racing ahead. Each queued tool stays
+-- blocked (no edit_done) until its turn, so the agent's ordering is preserved.
 M._edit_queue = M._edit_queue or {}
+M._edit_busy = M._edit_busy or false
 
--- True while an edit is in flight (typing, or held behind a Follow confirmation).
--- `M._edit` is set for the whole duration of on_edit/on_region, so it's a complete
--- busy signal; `M._pending_write` covers the Follow-confirm wait.
+-- True while an edit is in flight OR queued OR held behind a Follow confirmation.
 function M.busy_editing()
-	return M._edit ~= nil or M._pending_write ~= nil
+	return M._edit_busy or M._pending_write ~= nil
 end
 
--- Run the next queued edit, if any (scheduled so the current one unwinds first).
+-- An edit fully finished: run the next queued one directly (we still own the busy
+-- slot — dequeued items bypass the gate), or release the slot if the queue is empty.
 function M._edit_next()
 	local item = table.remove(M._edit_queue, 1)
 	if item then
-		vim.schedule(item.run)
+		vim.schedule(function()
+			if item.kind == "region" then
+				M._do_region(item.msg)
+			else
+				M._do_edit(item.msg)
+			end
+		end)
+	else
+		M._edit_busy = false
 	end
 end
 
--- Cancel path: release every queued (still-blocked) tool and empty the queue, so
--- pending writes don't fire after a stop.
+-- Cancel path: release every queued (still-blocked) tool, empty the queue, and drop
+-- the busy claim — so nothing fires after a stop.
 function M._drain_edit_queue()
 	local q = M._edit_queue
 	M._edit_queue = {}
+	M._edit_busy = false
 	for _, item in ipairs(q) do
 		send_cmd({ cmd = "edit_done", id = item.id, message = "cancelled" })
 	end
 end
 
--- If an edit is already running, defer this one (a closure that re-invokes the
--- edit with its original message, keyed by tool id so cancel can release it) and
--- report true; the caller returns immediately.
-local function defer_if_busy(id, handler)
+-- Gate an incoming edit: if something is already in flight, queue it (by kind + msg,
+-- keyed on tool id so cancel can release it) and report true. Otherwise claim the
+-- busy slot and report false so the caller runs its body now.
+local function defer_if_busy(kind, msg)
 	if M.busy_editing() then
-		table.insert(M._edit_queue, { id = id, run = handler })
+		table.insert(M._edit_queue, { id = msg.id, kind = kind, msg = msg })
 		return true
 	end
+	M._edit_busy = true
 	return false
 end
 
@@ -1212,15 +1224,21 @@ end
 -- persist it, then ack so the blocked tool returns and the agent continues.
 -- We do NOT steal focus (Follow-off behaviour) — <leader>lg jumps you to it.
 function M.on_edit(msg)
-	-- An edit is already typing → wait our turn (serialized; see M._edit_queue).
-	if defer_if_busy(msg.id, function() M.on_edit(msg) end) then
+	-- An edit is already in flight → wait our turn (serialized; see M._edit_queue).
+	if defer_if_busy("edit", msg) then
 		return
 	end
+	M._do_edit(msg)
+end
+
+-- The body of a write, run once it owns the busy slot (either immediately from the
+-- gate, or when dequeued). Never call this directly — go through M.on_edit.
+function M._do_edit(msg)
 	-- Safety net: if a region edit is pending (you selected/marked a spot), the Driver
 	-- should have used loupe_region. If it used loupe_write instead, still apply to the
-	-- REGION — never blow away the whole file.
+	-- REGION — never blow away the whole file. (Call the body directly: we own the slot.)
 	if M._region and vim.api.nvim_buf_is_valid(M._region.buf) then
-		return M.on_region({ id = msg.id, content = msg.content })
+		return M._do_region({ id = msg.id, content = msg.content })
 	end
 	local file = msg.file or ""
 	if file == "" then
@@ -1316,10 +1334,15 @@ end
 -- mark-anchored typewriter, so you can keep editing outside it. M._region holds
 -- the region's marks (set up by chat_here when you ask the Driver about a selection).
 function M.on_region(msg)
-	-- Serialize behind any edit already typing (see M._edit_queue).
-	if defer_if_busy(msg.id, function() M.on_region(msg) end) then
+	-- Serialize behind any edit already in flight (see M._edit_queue).
+	if defer_if_busy("region", msg) then
 		return
 	end
+	M._do_region(msg)
+end
+
+-- The body of a region edit, run once it owns the busy slot. Go through M.on_region.
+function M._do_region(msg)
 	local r = M._region
 	if not r or not vim.api.nvim_buf_is_valid(r.buf) then
 		send_cmd({ cmd = "edit_done", id = msg.id, message = "no active region to edit" })
