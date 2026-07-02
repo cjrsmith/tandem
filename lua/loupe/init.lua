@@ -2,6 +2,10 @@ local M = {}
 
 local ns = vim.api.nvim_create_namespace("loupe")
 local edit_ns = vim.api.nvim_create_namespace("loupe_edit") -- the "AI is writing here" highlight
+-- Region markers live in their OWN namespace so a running typewriter's clear_edit
+-- (which wipes edit_ns) can't erase a still-PENDING region's marks. This is what lets
+-- several region requests be armed at once (select A, ask; select B, ask; …).
+local region_ns = vim.api.nvim_create_namespace("loupe_region")
 
 -- Diff-style highlight over the region the AI is actively typing into. `default`
 -- so a user colourscheme can override it.
@@ -254,16 +258,20 @@ local stream = {
 	interval = 80, -- ms per chunk
 }
 
--- 0-indexed position of an extmark, or nil if it's gone.
-local function mark_pos(buf, id)
+-- 0-indexed position of an extmark in a given namespace, or nil if it's gone.
+local function mark_pos_ns(buf, mns, id)
 	if not id then
 		return nil
 	end
-	local p = vim.api.nvim_buf_get_extmark_by_id(buf, edit_ns, id, {})
+	local p = vim.api.nvim_buf_get_extmark_by_id(buf, mns, id, {})
 	if #p == 0 then
 		return nil
 	end
 	return p[1], p[2]
+end
+-- Position of an edit_ns mark (the typewriter's own marks).
+local function mark_pos(buf, id)
+	return mark_pos_ns(buf, edit_ns, id)
 end
 
 -- Refresh the region's highlight (top→bottom) + the cached active-edit bounds.
@@ -843,6 +851,7 @@ function M.chat_here(mode, scope, opts)
 		local do_fork = (mode == "fork" and cur == nil and M.active_session ~= nil)
 		local source = do_fork and M.active_session or cur
 
+		local my_region -- the region this turn armed (if any), so its done-handler can withdraw it
 		local parts = {}
 		if cur == nil and mode == "working" then -- journal: fresh working session only
 			local journal = M.read_journal()
@@ -858,22 +867,22 @@ function M.chat_here(mode, scope, opts)
 				and ("I'm editing this file — use exactly this path with loupe_write: " .. fname .. "\n")
 				or ""
 			parts[#parts + 1] = where .. "Context (" .. context.label .. "):\n" .. context.text
-			-- Driver region edits: mark the target and have the Driver fill ONLY that
-			-- region via loupe_region (you can keep editing outside it).
+			-- Driver region edits: mark the target (in region_ns, so a concurrently-typing
+			-- edit can't wipe it) and ARM it on the FIFO queue. Several can be armed at once —
+			-- the Driver fills each via loupe_region, in order.
 			if M.role == "driver" then
 				local b = origin.buf
-				M.clear_edit() -- drop any stale region
 				local label = { { { IMPL_LABEL, "LoupeImplementing" } } }
 				if sel_range then
 					-- SELECTION → replace it (shown marked, since you clearly want an edit)
 					local last = vim.api.nvim_buf_get_lines(b, sel_range.erow, sel_range.erow + 1, false)[1] or ""
-					local top = vim.api.nvim_buf_set_extmark(b, edit_ns, sel_range.srow, 0, {
+					local top = vim.api.nvim_buf_set_extmark(b, region_ns, sel_range.srow, 0, {
 						right_gravity = false, virt_lines_above = true, virt_lines = label,
 					})
-					local bot = vim.api.nvim_buf_set_extmark(b, edit_ns, sel_range.erow, #last, {
+					local bot = vim.api.nvim_buf_set_extmark(b, region_ns, sel_range.erow, #last, {
 						right_gravity = true, virt_lines = label,
 					})
-					M._region = { buf = b, top = top, bot = bot, kind = "replace" }
+					my_region = M.region_arm({ buf = b, top = top, bot = bot, kind = "replace" })
 					parts[#parts + 1] =
 						"IMPORTANT: implement this as a REGION edit. Call the loupe_region tool with ONLY the replacement code for the selected region — do not rewrite the whole file or use loupe_write."
 				elseif scope == "line" then
@@ -881,9 +890,9 @@ function M.chat_here(mode, scope, opts)
 					-- markers appear once it actually writes.
 					local cr = origin.row - 1
 					local line = vim.api.nvim_buf_get_lines(b, cr, cr + 1, false)[1] or ""
-					local top = vim.api.nvim_buf_set_extmark(b, edit_ns, cr, #line, { right_gravity = false })
-					local bot = vim.api.nvim_buf_set_extmark(b, edit_ns, cr, #line, { right_gravity = true })
-					M._region = { buf = b, top = top, bot = bot, kind = "insert" }
+					local top = vim.api.nvim_buf_set_extmark(b, region_ns, cr, #line, { right_gravity = false })
+					local bot = vim.api.nvim_buf_set_extmark(b, region_ns, cr, #line, { right_gravity = true })
+					my_region = M.region_arm({ buf = b, top = top, bot = bot, kind = "insert" })
 					parts[#parts + 1] =
 						"There is an insertion point marked at my cursor. If I'm asking you to write or insert code, call the loupe_region tool with ONLY that code (it will be placed at the marked point — do not rewrite the whole file). If I'm only asking a question, just answer normally."
 				end
@@ -913,10 +922,11 @@ function M.chat_here(mode, scope, opts)
 					vim.notify("Loupe: suggestion ready — <leader>li to ghost it")
 				end
 			end
-			-- region was set up but the Driver never called loupe_region → drop the marks
-			if M._region and M._region.buf == origin.buf then
-				M.clear_edit()
-				M._region = nil
+			-- this turn armed a region but the Driver never filled it (answered instead)
+			-- → withdraw it so it doesn't linger for a later loupe_region call
+			if my_region then
+				M.region_withdraw(my_region)
+				my_region = nil
 			end
 		end, do_fork)
 	end)
@@ -1211,6 +1221,58 @@ local function defer_if_busy(kind, msg)
 	return false
 end
 
+-- ── Pending regions (FIFO) ──────────────────────────────────────
+-- Each "select a region + ask" arms a region (its own marks in region_ns). Several
+-- can be armed at once; they're consumed in ORDER by loupe_region calls (turns run
+-- sequentially, so the Nth loupe_region belongs to the Nth armed region). An entry is
+-- { buf, top, bot, kind, ns }.
+M._region_queue = M._region_queue or {}
+
+-- Delete a region entry's marks (its ⟨implementing⟩ labels), if still present.
+local function region_clear_marks(e)
+	if e and e.buf and vim.api.nvim_buf_is_valid(e.buf) then
+		pcall(vim.api.nvim_buf_del_extmark, e.buf, e.ns or region_ns, e.top)
+		pcall(vim.api.nvim_buf_del_extmark, e.buf, e.ns or region_ns, e.bot)
+	end
+end
+
+-- Arm a region: remember its marks and return the entry (kept by the caller so it can
+-- withdraw it if the turn ends without editing).
+function M.region_arm(entry)
+	entry.ns = entry.ns or region_ns
+	M._region_queue[#M._region_queue + 1] = entry
+	return entry
+end
+
+-- Withdraw a specific armed region (the turn answered instead of editing it).
+function M.region_withdraw(entry)
+	for i, e in ipairs(M._region_queue) do
+		if e == entry then
+			table.remove(M._region_queue, i)
+			region_clear_marks(e)
+			return
+		end
+	end
+end
+
+-- Any region currently armed? (front of the queue, if its buffer is still valid.)
+function M.region_pending()
+	local e = M._region_queue[1]
+	if e and vim.api.nvim_buf_is_valid(e.buf) then
+		return e
+	end
+	return nil
+end
+
+-- Cancel path: drop every armed region + its marks.
+function M._drain_region_queue()
+	local q = M._region_queue
+	M._region_queue = {}
+	for _, e in ipairs(q) do
+		region_clear_marks(e)
+	end
+end
+
 -- The agent's loupe_write tool (via the daemon bridge) wants to write a file. We
 -- own application: type the content into the buffer with the watchable typewriter,
 -- persist it, then ack so the blocked tool returns and the agent continues.
@@ -1226,10 +1288,10 @@ end
 -- The body of a write, run once it owns the busy slot (either immediately from the
 -- gate, or when dequeued). Never call this directly — go through M.on_edit.
 function M._do_edit(msg)
-	-- Safety net: if a region edit is pending (you selected/marked a spot), the Driver
-	-- should have used loupe_region. If it used loupe_write instead, still apply to the
+	-- Safety net: if a region is armed (you selected/marked a spot), the Driver should
+	-- have used loupe_region. If it used loupe_write instead, still apply to the armed
 	-- REGION — never blow away the whole file. (Call the body directly: we own the slot.)
-	if M._region and vim.api.nvim_buf_is_valid(M._region.buf) then
+	if M.region_pending() then
 		return M._do_region({ id = msg.id, content = msg.content })
 	end
 	local file = msg.file or ""
@@ -1321,10 +1383,10 @@ function M._do_edit(msg)
 	end)
 end
 
--- The agent's loupe_region tool: replace ONLY the currently-marked region (a
--- selection the user pointed at) with the returned snippet — typed in via the
--- mark-anchored typewriter, so you can keep editing outside it. M._region holds
--- the region's marks (set up by chat_here when you ask the Driver about a selection).
+-- The agent's loupe_region tool: replace ONLY a marked region (a selection the user
+-- pointed at) with the returned snippet — typed in via the mark-anchored typewriter,
+-- so you can keep editing outside it. Regions are consumed FIFO from M._region_queue:
+-- the Nth loupe_region call fills the Nth region you armed.
 function M.on_region(msg)
 	-- Serialize behind any edit already in flight (see M._edit_queue).
 	if defer_if_busy("region", msg) then
@@ -1335,15 +1397,18 @@ end
 
 -- The body of a region edit, run once it owns the busy slot. Go through M.on_region.
 function M._do_region(msg)
-	local r = M._region
-	if not r or not vim.api.nvim_buf_is_valid(r.buf) then
+	local r = table.remove(M._region_queue, 1) -- oldest armed region
+	while r and not vim.api.nvim_buf_is_valid(r.buf) do -- skip any whose buffer is gone
+		r = table.remove(M._region_queue, 1)
+	end
+	if not r then
 		send_cmd({ cmd = "edit_done", id = msg.id, message = "no active region to edit" })
 		M._edit_next()
 		return
 	end
-	M._region = nil
-	local tr, tc = mark_pos(r.buf, r.top)
-	local br, bc = mark_pos(r.buf, r.bot)
+	local tr, tc = mark_pos_ns(r.buf, r.ns or region_ns, r.top)
+	local br, bc = mark_pos_ns(r.buf, r.ns or region_ns, r.bot)
+	region_clear_marks(r) -- consumed → drop its ⟨implementing⟩ labels
 	if not tr or not br then
 		send_cmd({ cmd = "edit_done", id = msg.id, message = "region markers were lost" })
 		M._edit_next()
@@ -1546,6 +1611,7 @@ function M.interrupt_edit()
 	end
 	M.pause() -- freeze the typewriter
 	M._drain_edit_queue() -- release any writes queued behind this one (turn is ending)
+	M._drain_region_queue() -- withdraw any regions armed for this turn
 	stream.on_done = nil -- don't let a stray resume auto-ack
 	stream.idx = #stream.chunks -- neutralise the queue
 	M._edit = nil
@@ -1598,6 +1664,7 @@ function M.continue_work()
 	M.toast_dismiss()
 	M.toast("▶ continuing where we left off…")
 	local extra = ""
+	local armed -- the region we re-arm for the continuation (if any)
 	if held and held.top and vim.api.nvim_buf_is_valid(held.buf) then
 		local tr, tc = mark_pos(held.buf, held.top)
 		local br, bc = mark_pos(held.buf, held.bot)
@@ -1607,11 +1674,11 @@ function M.continue_work()
 				.. cur
 				.. "\n\nReturn the COMPLETE finished code for THIS region via loupe_region — it replaces only the marked region; do NOT rewrite the rest of the file."
 			-- keep the held marks and scope the continuation to them, so it re-types
-			-- only the region (not the whole file).
-			M._region = { buf = held.buf, top = held.top, bot = held.bot, kind = "replace" }
+			-- only the region (not the whole file). The held marks live in edit_ns.
+			armed = M.region_arm({ buf = held.buf, top = held.top, bot = held.bot, kind = "replace", ns = edit_ns })
 		end
 	end
-	if not M._region then
+	if not armed then
 		M.clear_edit() -- no held region → just continue normally
 	end
 	M.run(
@@ -1651,6 +1718,7 @@ end
 function M.cancel_all()
 	M.pause() -- stop any in-progress typing
 	M._drain_edit_queue() -- release any queued (blocked) writes
+	M._drain_region_queue() -- withdraw any armed regions
 	if daemon.job and daemon.ready then
 		vim.fn.chansend(daemon.job, vim.json.encode({ cmd = "cancel_all" }) .. "\n")
 	end
