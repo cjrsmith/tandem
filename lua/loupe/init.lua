@@ -1154,11 +1154,58 @@ function M.confirm_write()
 	end
 end
 
+-- Serialize concurrent edits: the typewriter is single-stream, so when the agent
+-- issues several writes/regions in one turn (parallel tool calls), we run them ONE
+-- AT A TIME in arrival order. A busy edit holds the others in `M._edit_queue`; each
+-- finishing edit pumps the next. Each queued tool stays blocked (no edit_done) until
+-- its turn, so the agent's own ordering is preserved and nothing clobbers anything.
+M._edit_queue = M._edit_queue or {}
+
+-- True while an edit is in flight (typing, or held behind a Follow confirmation).
+-- `M._edit` is set for the whole duration of on_edit/on_region, so it's a complete
+-- busy signal; `M._pending_write` covers the Follow-confirm wait.
+function M.busy_editing()
+	return M._edit ~= nil or M._pending_write ~= nil
+end
+
+-- Run the next queued edit, if any (scheduled so the current one unwinds first).
+function M._edit_next()
+	local item = table.remove(M._edit_queue, 1)
+	if item then
+		vim.schedule(item.run)
+	end
+end
+
+-- Cancel path: release every queued (still-blocked) tool and empty the queue, so
+-- pending writes don't fire after a stop.
+function M._drain_edit_queue()
+	local q = M._edit_queue
+	M._edit_queue = {}
+	for _, item in ipairs(q) do
+		send_cmd({ cmd = "edit_done", id = item.id, message = "cancelled" })
+	end
+end
+
+-- If an edit is already running, defer this one (a closure that re-invokes the
+-- edit with its original message, keyed by tool id so cancel can release it) and
+-- report true; the caller returns immediately.
+local function defer_if_busy(id, handler)
+	if M.busy_editing() then
+		table.insert(M._edit_queue, { id = id, run = handler })
+		return true
+	end
+	return false
+end
+
 -- The agent's loupe_write tool (via the daemon bridge) wants to write a file. We
 -- own application: type the content into the buffer with the watchable typewriter,
 -- persist it, then ack so the blocked tool returns and the agent continues.
 -- We do NOT steal focus (Follow-off behaviour) — <leader>lg jumps you to it.
 function M.on_edit(msg)
+	-- An edit is already typing → wait our turn (serialized; see M._edit_queue).
+	if defer_if_busy(msg.id, function() M.on_edit(msg) end) then
+		return
+	end
 	-- Safety net: if a region edit is pending (you selected/marked a spot), the Driver
 	-- should have used loupe_region. If it used loupe_write instead, still apply to the
 	-- REGION — never blow away the whole file.
@@ -1168,6 +1215,7 @@ function M.on_edit(msg)
 	local file = msg.file or ""
 	if file == "" then
 		send_cmd({ cmd = "edit_done", id = msg.id, message = "no file given" })
+		M._edit_next()
 		return
 	end
 	if not file:match("^/") then -- resolve relative paths against cwd
@@ -1188,6 +1236,7 @@ function M.on_edit(msg)
 		end)
 		M._edit = nil
 		send_cmd({ cmd = "edit_done", id = msg.id, message = "wrote " .. file })
+		M._edit_next() -- run the next queued edit, if any
 	end
 
 	-- DIFF-BASED application: type only the changed span, leaving untouched code
@@ -1257,9 +1306,14 @@ end
 -- mark-anchored typewriter, so you can keep editing outside it. M._region holds
 -- the region's marks (set up by chat_here when you ask the Driver about a selection).
 function M.on_region(msg)
+	-- Serialize behind any edit already typing (see M._edit_queue).
+	if defer_if_busy(msg.id, function() M.on_region(msg) end) then
+		return
+	end
 	local r = M._region
 	if not r or not vim.api.nvim_buf_is_valid(r.buf) then
 		send_cmd({ cmd = "edit_done", id = msg.id, message = "no active region to edit" })
+		M._edit_next()
 		return
 	end
 	M._region = nil
@@ -1267,6 +1321,7 @@ function M.on_region(msg)
 	local br, bc = mark_pos(r.buf, r.bot)
 	if not tr or not br then
 		send_cmd({ cmd = "edit_done", id = msg.id, message = "region markers were lost" })
+		M._edit_next()
 		return
 	end
 	-- register as the in-flight edit so M.interrupt_edit can pause it
@@ -1304,6 +1359,7 @@ function M.on_region(msg)
 				end)
 				M._edit = nil -- region edit completed normally
 				send_cmd({ cmd = "edit_done", id = msg.id, message = "applied region edit" })
+				M._edit_next() -- run the next queued edit, if any
 			end,
 		})
 	end)
@@ -1464,6 +1520,7 @@ function M.interrupt_edit()
 		return
 	end
 	M.pause() -- freeze the typewriter
+	M._drain_edit_queue() -- release any writes queued behind this one (turn is ending)
 	stream.on_done = nil -- don't let a stray resume auto-ack
 	stream.idx = #stream.chunks -- neutralise the queue
 	M._edit = nil
@@ -1568,6 +1625,7 @@ end
 -- typewriter mid-type, and clear the spinner / toasts / pending question.
 function M.cancel_all()
 	M.pause() -- stop any in-progress typing
+	M._drain_edit_queue() -- release any queued (blocked) writes
 	if daemon.job and daemon.ready then
 		vim.fn.chansend(daemon.job, vim.json.encode({ cmd = "cancel_all" }) .. "\n")
 	end
