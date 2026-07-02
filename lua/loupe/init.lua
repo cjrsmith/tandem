@@ -86,9 +86,9 @@ function M.pick_model()
 			local switched = M.backend() ~= choice.backend
 			M.active_model = choice
 			if switched then
-				-- crossing backends: load THIS backend's session for the active workpackage
-				M._usage = nil
-				pcall(M.wp_load)
+				-- backend is bound to the session (ids can't cross-resume) → move to a
+				-- session on the new backend in this workpackage (reuse or create).
+				pcall(M.switch_backend, choice.backend)
 			end
 			vim.notify("Loupe model → " .. choice.label .. (switched and ("  [" .. choice.backend .. "]") or ""))
 			M.rail_refresh()
@@ -112,16 +112,8 @@ function M.pick_granularity()
 	end)
 end
 
--- Start a new working session in the current workpackage (fresh conversation).
-function M.new_session()
-	if M.set_active_session then
-		M.set_active_session(nil)
-	else
-		M.active_session = nil
-	end
-	vim.notify("Loupe: new working session")
-	M.rail_refresh()
-end
+-- (M.new_session lives with the workpackage/session code below — it adds a fresh
+-- session to the ACTIVE workpackage.)
 
 function M.setup(opts)
 	M.opts = opts or {}
@@ -1781,11 +1773,20 @@ function M.compact()
 	send_cmd({ cmd = "compact", tag = tag, session = session, backend = M.backend() })
 end
 
--- ── Workpackages (named session + journal + backlog) ────────────
--- A workpackage is a named working context: its own opencode session, a journal
--- (the brief/plan/decisions for this chunk of work), and a backlog. No workpackage
--- selected → a "default" one. Switching workpackage = switching session + loading
--- its journal/backlog. Big repos have several (refactor, docker, …); small ones one.
+-- ── Workpackages & sessions ─────────────────────────────────────
+-- Hierarchy: a WORKPACKAGE is a named container for a chunk of work — it owns a
+-- shared JOURNAL (context/brief across all its sessions) and a backlog. A SESSION
+-- is one conversation thread inside a workpackage; a workpackage has MANY. Neither
+-- exists without the other: a new workpackage is born with its first session, and a
+-- new session is created inside the active workpackage. Switching = picking a
+-- session (shown workpackage ▸ session); its workpackage comes with it. Each session
+-- records the backend it runs on (opencode/claude ids can't cross-resume), so
+-- selecting a session restores its backend.
+--
+-- manifest.json = {
+--   active   = { wp = "<name>", key = "<session key>" },
+--   packages = { ["<name>"] = { sessions = { {key,name,id,backend}, … } }, … },
+-- }
 local function wp_root()
 	return vim.fn.getcwd() .. "/.loupe/wp"
 end
@@ -1799,15 +1800,81 @@ function M.wp_backlog_path(name)
 	return wp_dir(name or M.wp_active()) .. "/backlog.md"
 end
 
+-- A fresh, unique session key (identity that survives before the backend hands us a
+-- real session id — a new session has id=nil until its first turn).
+local function new_key()
+	M._keyn = (M._keyn or 0) + 1
+	return "k" .. os.time() .. "_" .. M._keyn
+end
+
+-- Upgrade any older manifest shape (single pkg.session, per-backend session map, or a
+-- string `active`) to the current { active={wp,key}, sessions=[…] } form.
+local function normalize(m)
+	if type(m) ~= "table" then
+		m = {}
+	end
+	m.packages = type(m.packages) == "table" and m.packages or {}
+	for name, pkg in pairs(m.packages) do
+		if type(pkg) ~= "table" then
+			pkg = {}
+			m.packages[name] = pkg
+		end
+		local sess = pkg.sessions
+		local is_array = type(sess) == "table" and (sess[1] ~= nil or next(sess) == nil)
+		if not is_array then
+			-- old per-backend MAP { opencode=…, claude=… }
+			local arr = {}
+			if type(sess) == "table" then
+				for backend, id in pairs(sess) do
+					if type(id) == "string" then
+						arr[#arr + 1] = { key = new_key(), name = backend .. " session", id = id, backend = backend }
+					end
+				end
+			end
+			pkg.sessions = arr
+		end
+		if type(pkg.session) == "string" then -- oldest single-session field
+			pkg.sessions[#pkg.sessions + 1] = { key = new_key(), name = "session", id = pkg.session, backend = "opencode" }
+			pkg.session = nil
+		end
+		if #pkg.sessions == 0 then
+			pkg.sessions[1] = { key = new_key(), name = "session 1", id = nil, backend = "opencode" }
+		end
+	end
+	if not m.packages["default"] then
+		m.packages["default"] = { sessions = { { key = new_key(), name = "session 1", id = nil, backend = "opencode" } } }
+	end
+	-- active pointer
+	if type(m.active) == "string" then
+		local wp = m.packages[m.active] and m.active or "default"
+		m.active = { wp = wp, key = m.packages[wp].sessions[1].key }
+	elseif type(m.active) ~= "table" or not m.active.wp or not m.packages[m.active.wp] then
+		m.active = { wp = "default", key = m.packages["default"].sessions[1].key }
+	end
+	-- ensure the active key resolves to a real session in the active wp
+	local sessions = m.packages[m.active.wp].sessions
+	local found = false
+	for _, e in ipairs(sessions) do
+		if e.key == m.active.key then
+			found = true
+			break
+		end
+	end
+	if not found then
+		m.active.key = sessions[1].key
+	end
+	return m
+end
+
 local function wp_read_manifest()
 	local p = wp_root() .. "/manifest.json"
 	if vim.fn.filereadable(p) == 1 then
 		local ok, data = pcall(vim.json.decode, table.concat(vim.fn.readfile(p), "\n"))
-		if ok and type(data) == "table" and type(data.packages) == "table" then
-			return data
+		if ok then
+			return normalize(data)
 		end
 	end
-	return { active = "default", packages = { ["default"] = {} } }
+	return normalize({})
 end
 local function wp_write_manifest(m)
 	vim.fn.mkdir(wp_root(), "p")
@@ -1820,110 +1887,222 @@ local function wp_manifest()
 	return M._wp
 end
 
--- The active workpackage name (ensuring a default exists).
+-- The active workpackage's name.
 function M.wp_active()
-	local m = wp_manifest()
-	if not m.active or not m.packages[m.active] then
-		m.active = "default"
-		m.packages["default"] = m.packages["default"] or {}
+	return wp_manifest().active.wp
+end
+
+-- The active session's entry table ({ key, name, id, backend }) within its workpackage.
+local function active_entry(m)
+	m = m or wp_manifest()
+	for _, e in ipairs(m.packages[m.active.wp].sessions) do
+		if e.key == m.active.key then
+			return e
+		end
 	end
-	return m.active
+	return m.packages[m.active.wp].sessions[1]
 end
 
--- Sessions are stored PER BACKEND on each workpackage: an opencode session id and
--- a Claude session id can't be resumed by the other backend, so we keep them apart
--- (`pkg.sessions = { opencode=…, claude=… }`) and surface whichever matches the
--- active backend. Legacy manifests with a single `pkg.session` migrate into the
--- opencode slot on first touch.
-local function wp_pkg()
-	local m = wp_manifest()
-	local name = M.wp_active()
-	m.packages[name] = m.packages[name] or {}
-	local pkg = m.packages[name]
-	pkg.sessions = pkg.sessions or {}
-	if pkg.session and not pkg.sessions.opencode then
-		pkg.sessions.opencode = pkg.session -- migrate legacy single-session field
-	end
-	return m, pkg
+-- The active session's display name (for the rail / pickers).
+function M.session_name()
+	local e = active_entry()
+	return e and e.name or "session"
 end
 
--- The active workpackage's stored session for the CURRENT backend (or nil = fresh).
-function M.wp_session()
-	local _, pkg = wp_pkg()
-	return pkg.sessions[M.backend()]
-end
-
--- Point M.active_session at the active workpackage's stored session (call at startup,
--- and whenever the backend changes).
-function M.wp_load()
-	M.active_session = M.wp_session()
-	M.rail_refresh()
-end
-
--- Set the working session AND persist it onto the active workpackage (under the
--- current backend's slot).
-function M.set_active_session(id)
-	M.active_session = id
-	local m, pkg = wp_pkg()
-	pkg.sessions[M.backend()] = id
-	wp_write_manifest(m)
-end
-
--- Switch to an existing workpackage (loads its session + journal/backlog context).
-function M.wp_switch_to(name)
-	local m = wp_manifest()
-	if not m.packages[name] then
+-- Make active_model match a backend (called when selecting a session so its thread
+-- can actually be resumed on the backend it was created under).
+function M._restore_backend(backend)
+	if not backend or M.backend() == backend then
 		return
 	end
-	m.active = name
-	wp_write_manifest(m)
-	M.active_session = M.wp_session()
-	M._usage = nil
-	M.rail_refresh()
-	vim.notify("Loupe workpackage → " .. name)
+	for _, mo in ipairs(M.models) do
+		if mo.backend == backend then
+			M.active_model = mo
+			return
+		end
+	end
 end
 
--- Create a new workpackage (fresh session) and switch to it.
+-- Adopt the active session on startup: point M.active_session at its stored id and
+-- restore its backend.
+function M.wp_load()
+	local e = active_entry()
+	M.active_session = e and e.id or nil
+	if e then
+		M._restore_backend(e.backend)
+	end
+	M.rail_refresh()
+end
+
+-- The backend just handed us a real session id for the active (possibly brand-new)
+-- session — record it (and the backend it belongs to) on the active entry.
+function M.set_active_session(id)
+	M.active_session = id
+	local m = wp_manifest()
+	local e = active_entry(m)
+	if e then
+		e.id = id
+		e.backend = M.backend()
+		wp_write_manifest(m)
+	end
+end
+
+-- Create a NEW session inside the active workpackage (shares its journal/backlog).
+-- Fresh thread: active_session = nil until its first turn. Uses the current backend.
+function M.new_session(name)
+	local m = wp_manifest()
+	local sessions = m.packages[m.active.wp].sessions
+	name = (name and vim.trim(name) ~= "" and vim.trim(name)) or ("session " .. (#sessions + 1))
+	local key = new_key()
+	sessions[#sessions + 1] = { key = key, name = name, id = nil, backend = M.backend() }
+	m.active.key = key
+	wp_write_manifest(m)
+	M.active_session = nil
+	M._usage = nil
+	M.rail_refresh()
+	vim.notify("Loupe: new session '" .. name .. "' in " .. m.active.wp)
+end
+
+-- Create a NEW workpackage — born with its first session — and switch to it.
 function M.wp_create(name)
 	name = name and vim.trim(name) or ""
 	if name == "" then
 		return
 	end
 	local m = wp_manifest()
-	m.packages[name] = m.packages[name] or {}
-	m.active = name
+	if m.packages[name] then
+		vim.notify("Loupe: workpackage '" .. name .. "' already exists")
+		return
+	end
+	local key = new_key()
+	m.packages[name] = { sessions = { { key = key, name = "session 1", id = nil, backend = M.backend() } } }
+	m.active = { wp = name, key = key }
 	wp_write_manifest(m)
 	vim.fn.mkdir(wp_dir(name), "p")
-	M.active_session = M.wp_session() -- nil = fresh
+	M.active_session = nil
 	M._usage = nil
 	M.rail_refresh()
 	vim.notify("Loupe workpackage → " .. name)
 end
 
--- List/switch workpackages (or create a new one).
-function M.wp_pick()
+-- Prompt for a name, then create a workpackage.
+function M.wp_new()
+	M.ask(function(name)
+		M.wp_create(name)
+	end, { title = " new workpackage name " })
+end
+
+-- Activate a specific session (by workpackage + key): load its id + backend.
+function M.activate_session(wp, key)
+	local m = wp_manifest()
+	if not m.packages[wp] then
+		return
+	end
+	local target
+	for _, e in ipairs(m.packages[wp].sessions) do
+		if e.key == key then
+			target = e
+			break
+		end
+	end
+	if not target then
+		return
+	end
+	m.active = { wp = wp, key = key }
+	wp_write_manifest(m)
+	M.active_session = target.id
+	M._usage = nil
+	M._restore_backend(target.backend)
+	M.rail_refresh()
+	vim.notify("Loupe → " .. wp .. " ▸ " .. target.name)
+end
+
+-- Switch sessions via a hierarchy: every workpackage's sessions listed as
+-- "workpackage ▸ session", plus shortcuts to add a session or a workpackage.
+function M.session_pick()
 	local m = wp_manifest()
 	local names = {}
 	for n in pairs(m.packages) do
 		names[#names + 1] = n
 	end
 	table.sort(names)
-	names[#names + 1] = "+ new workpackage…"
-	vim.ui.select(names, { prompt = "Workpackage (active: " .. M.wp_active() .. ")" }, function(choice)
-		if not choice then
+	local items = {}
+	for _, wp in ipairs(names) do
+		for _, e in ipairs(m.packages[wp].sessions) do
+			local active = (wp == m.active.wp and e.key == m.active.key)
+			items[#items + 1] = {
+				kind = "session",
+				wp = wp,
+				key = e.key,
+				label = (active and "● " or "  ")
+					.. wp
+					.. "  ▸  "
+					.. e.name
+					.. "  ("
+					.. (e.backend or "opencode")
+					.. (e.id and "" or " · new")
+					.. ")",
+			}
+		end
+	end
+	items[#items + 1] = { kind = "new_session", label = "＋ new session (in " .. m.active.wp .. ")" }
+	items[#items + 1] = { kind = "new_wp", label = "＋ new workpackage…" }
+	vim.ui.select(items, {
+		prompt = "Switch session:",
+		format_item = function(it)
+			return it.label
+		end,
+	}, function(it)
+		if not it then
 			return
 		end
-		if choice == "+ new workpackage…" then
-			M.ask(function(name)
-				M.wp_create(name)
-			end, { title = " new workpackage name " })
-		else
-			M.wp_switch_to(choice)
+		if it.kind == "session" then
+			M.activate_session(it.wp, it.key)
+		elseif it.kind == "new_session" then
+			M.new_session()
+		elseif it.kind == "new_wp" then
+			M.wp_new()
 		end
 	end)
 end
 
--- Rename the active workpackage.
+-- Switch to a session on `backend` within the active workpackage: reuse the most
+-- recent one if present, else start a fresh session. Used when the picked model's
+-- backend differs from the current session's (their ids can't cross-resume).
+function M.switch_backend(backend)
+	local m = wp_manifest()
+	local sessions = m.packages[m.active.wp].sessions
+	local pick
+	for _, e in ipairs(sessions) do
+		if (e.backend or "opencode") == backend then
+			pick = e -- last match wins = most recent
+		end
+	end
+	if pick then
+		M.activate_session(m.active.wp, pick.key)
+	else
+		M.new_session() -- uses M.backend() = the just-selected model's backend
+	end
+end
+
+-- Rename the active session.
+function M.session_rename()
+	local e = active_entry()
+	local old = e and e.name or "session"
+	M.ask(function(new)
+		new = vim.trim(new)
+		if new == "" or new == old then
+			return
+		end
+		local m = wp_manifest()
+		active_entry(m).name = new
+		wp_write_manifest(m)
+		M.rail_refresh()
+		vim.notify("Renamed session → " .. new)
+	end, { title = " rename session '" .. old .. "' to " })
+end
+
+-- Rename the active workpackage (moves its journal/backlog dir with it).
 function M.wp_rename()
 	local old = M.wp_active()
 	M.ask(function(new)
@@ -1932,14 +2111,20 @@ function M.wp_rename()
 			return
 		end
 		local m = wp_manifest()
+		if m.packages[new] then
+			vim.notify("Loupe: workpackage '" .. new .. "' already exists")
+			return
+		end
 		m.packages[new] = m.packages[old]
 		m.packages[old] = nil
-		m.active = new
+		if m.active.wp == old then
+			m.active.wp = new
+		end
 		wp_write_manifest(m)
 		pcall(os.rename, wp_dir(old), wp_dir(new))
 		M.rail_refresh()
 		vim.notify("Renamed workpackage → " .. new)
-	end, { title = " rename '" .. old .. "' to " })
+	end, { title = " rename workpackage '" .. old .. "' to " })
 end
 
 -- The active workpackage's journal (its brief/plan/decisions), injected as context.
@@ -2466,9 +2651,11 @@ function M.settings_menu()
 		{ label = "Coach (toggle)", run = M.toggle_coach },
 		{ label = "Follow (toggle)", run = M.toggle_follow },
 		{ label = "Typing pace", run = M.pick_granularity },
+		{ label = "Switch session", run = M.session_pick },
 		{ label = "New session", run = M.new_session },
-		{ label = "Compact session", run = M.compact },
-		{ label = "Switch workpackage", run = M.wp_pick },
+		{ label = "Rename session", run = M.session_rename },
+		{ label = "Compact conversation", run = M.compact },
+		{ label = "New workpackage", run = M.wp_new },
 		{ label = "Rename workpackage", run = M.wp_rename },
 		{ label = "Open backlog", run = M.backlog },
 		{ label = "Plan backlog (AI)", run = M.plan },
@@ -2507,13 +2694,6 @@ function M.render_rail(buf, todo)
 	if not vim.api.nvim_buf_is_valid(buf) then
 		return
 	end
-	local function sid()
-		if not M.active_session then
-			return "new"
-		end
-		local s = tostring(M.active_session)
-		return #s > 11 and ("…" .. s:sub(-9)) or s
-	end
 	-- collapse a (possibly multi-line) item to one line that fits the rail width
 	local function fit(s, w)
 		s = vim.trim((s:gsub("%s+", " ")))
@@ -2539,8 +2719,13 @@ function M.render_rail(buf, todo)
 	lines[#lines + 1] = "  Model    " .. (M.active_model and M.active_model.label or "?")
 	lines[#lines + 1] = "  Backend  " .. M.backend()
 	lines[#lines + 1] = "  Pace     " .. M.granularity
-	lines[#lines + 1] = "  Package  " .. (pcall(M.wp_active) and M.wp_active() or "default")
-	lines[#lines + 1] = "  Session  " .. sid()
+	local wp_name, sess_name = "default", "session"
+	pcall(function()
+		wp_name = M.wp_active()
+		sess_name = M.session_name()
+	end)
+	lines[#lines + 1] = "  Package  " .. fit(wp_name, 22)
+	lines[#lines + 1] = "  Session  " .. fit(sess_name .. (M.active_session and "" or "  · new"), 22)
 	if M._usage then -- context size + spend for the active session
 		local u = M._usage
 		local ctx = u.context or 0
