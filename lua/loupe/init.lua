@@ -671,6 +671,13 @@ local function make_panel(box, title_label)
 	end
 	vim.keymap.set("n", "<Tab>", P.focus_conv, { buffer = input_buf })
 	vim.keymap.set({ "n", "i" }, "<C-c>", M.cancel_all, { buffer = input_buf })
+	-- @ → pick a file to reference (its content is injected into the prompt on send)
+	vim.keymap.set("i", "@", function()
+		M.pick_reference(function(choice)
+			vim.api.nvim_put({ choice and ("@" .. choice .. " ") or "@" }, "c", true, true)
+			vim.cmd("startinsert")
+		end)
+	end, { buffer = input_buf })
 	vim.keymap.set("n", "<Tab>", P.focus_input, { buffer = conv_buf })
 	vim.keymap.set("n", "<C-c>", M.cancel_all, { buffer = conv_buf })
 	for _, k in ipairs({ "i", "a", "o", "I", "A" }) do
@@ -685,6 +692,7 @@ end
 -- on_session(id) fires when the session id is learned; `fork` forks the session.
 local function panel_turn(P, session, user_text, prompt_text, on_session, on_done, fork, opts)
 	P.append_user(user_text)
+	prompt_text = M.resolve_refs(prompt_text) -- pull in any @file references
 	local acc, r_start, r_count = "", nil, nil
 	M.prompt(session, prompt_text, function(msg)
 		if msg.type == "session" then
@@ -1609,6 +1617,60 @@ function M.fetch_history(session, cb)
 	send_cmd({ cmd = "history", tag = tag, session = session })
 end
 
+-- Fetch token/cost usage for a session; caches into M._usage and refreshes the rail.
+function M.fetch_usage(session, cb)
+	session = session or M.active_session
+	if not session then
+		if cb then
+			cb(nil)
+		end
+		return
+	end
+	daemon.n = daemon.n + 1
+	local tag = "u" .. daemon.n
+	daemon.handlers[tag] = function(msg)
+		if msg.type == "usage" then
+			daemon.handlers[tag] = nil
+			if not msg.error then
+				M._usage = { cost = msg.cost, input = msg.input, output = msg.output, context = msg.context }
+				pcall(M.render_rail)
+			end
+			if cb then
+				cb(M._usage)
+			end
+		elseif msg.type == "error" then
+			daemon.handlers[tag] = nil
+			if cb then
+				cb(nil)
+			end
+		end
+	end
+	send_cmd({ cmd = "usage", tag = tag, session = session })
+end
+
+-- Compact (summarize) the active session so its context shrinks. Fire-and-forget with a toast.
+function M.compact()
+	local session = M.active_session
+	if not session then
+		M.toast("No active session to compact.")
+		return
+	end
+	M.toast("Compacting session…")
+	daemon.n = daemon.n + 1
+	local tag = "c" .. daemon.n
+	daemon.handlers[tag] = function(msg)
+		if msg.type == "compacted" then
+			daemon.handlers[tag] = nil
+			M.toast("Session compacted.")
+			M.fetch_usage(session)
+		elseif msg.type == "error" then
+			daemon.handlers[tag] = nil
+			M.toast("Compaction failed: " .. tostring(msg.error))
+		end
+	end
+	send_cmd({ cmd = "compact", tag = tag, session = session })
+end
+
 -- ── Workpackages (named session + journal + backlog) ────────────
 -- A workpackage is a named working context: its own opencode session, a journal
 -- (the brief/plan/decisions for this chunk of work), and a backlog. No workpackage
@@ -1775,6 +1837,43 @@ function M.journal_note()
 			M.journal_append(note)
 		end
 	end)
+end
+
+-- ── @-references (pull files into a prompt) ─────────────────────
+-- Repo files for the @ picker (tracked files; falls back to a find).
+function M.repo_files()
+	local files = vim.fn.systemlist({ "git", "ls-files" })
+	if vim.v.shell_error ~= 0 or #files == 0 then
+		files = vim.fn.systemlist({ "find", ".", "-type", "f", "-not", "-path", "*/.git/*", "-not", "-path", "*/node_modules/*" })
+		for i, f in ipairs(files) do
+			files[i] = (f:gsub("^%./", ""))
+		end
+	end
+	return files
+end
+
+-- Pick a file to reference; cb(path_or_nil).
+function M.pick_reference(cb)
+	vim.ui.select(M.repo_files(), { prompt = "@ reference a file:" }, cb)
+end
+
+-- Resolve @path references in a prompt: prepend each referenced file's content so the
+-- AI actually sees it. Leaves the @path in the text as a marker.
+function M.resolve_refs(text)
+	local extra, seen = {}, {}
+	for ref in text:gmatch("@([%w%._%-/]+)") do
+		if not seen[ref] then
+			seen[ref] = true
+			local path = ref:match("^/") and ref or (vim.fn.getcwd() .. "/" .. ref)
+			if vim.fn.filereadable(path) == 1 then
+				extra[#extra + 1] = "File @" .. ref .. ":\n" .. table.concat(vim.fn.readfile(path), "\n")
+			end
+		end
+	end
+	if #extra == 0 then
+		return text
+	end
+	return table.concat(extra, "\n\n") .. "\n\n" .. text
 end
 
 -- ── Backlog (per-workpackage, priority-ordered tasks) ───────────
@@ -2235,6 +2334,7 @@ function M.settings_menu()
 		{ label = "Follow (toggle)", run = M.toggle_follow },
 		{ label = "Typing pace", run = M.pick_granularity },
 		{ label = "New session", run = M.new_session },
+		{ label = "Compact session", run = M.compact },
 		{ label = "Switch workpackage", run = M.wp_pick },
 		{ label = "Rename workpackage", run = M.wp_rename },
 		{ label = "Open backlog", run = M.backlog },
@@ -2307,6 +2407,13 @@ function M.render_rail(buf, todo)
 	lines[#lines + 1] = "  Pace     " .. M.granularity
 	lines[#lines + 1] = "  Package  " .. (pcall(M.wp_active) and M.wp_active() or "default")
 	lines[#lines + 1] = "  Session  " .. sid()
+	if M._usage then -- context size + spend for the active session
+		local u = M._usage
+		local ctx = u.context or 0
+		local ctx_s = ctx >= 1000 and (string.format("%.1fk", ctx / 1000)) or tostring(ctx)
+		lines[#lines + 1] = "  Context  " .. ctx_s
+		lines[#lines + 1] = "  Cost     $" .. string.format("%.4f", u.cost or 0)
+	end
 	if todo then -- the command centre shows the workpackage backlog (top few)
 		lines[#lines + 1] = ""
 		lines[#lines + 1] = "  ──────────────"
@@ -2413,6 +2520,9 @@ function M.open_chat()
 			end
 		end
 	end)
+
+	-- pull token/cost usage for the active session into the rail
+	M.fetch_usage(M.active_session)
 
 	P.focus_input()
 end

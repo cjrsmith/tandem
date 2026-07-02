@@ -22,7 +22,7 @@ import os from "node:os";
 import path from "node:path";
 
 const MODEL = { providerID: "opencode", modelID: "north-mini-code-free" };
-const VERSION = "2026-07-01 ask+notify+instruct";
+const VERSION = "2026-07-02 usage+compact";
 
 // loupe_instruct: the Navigator gives the human ONE directive (a next step). Sticky,
 // non-blocking — shown in the notification bar until dismissed / next asked.
@@ -351,6 +351,31 @@ rl.on("line", (line) => {
           .filter((m) => m.text.trim() !== "");
         send({ tag: cmd.tag, type: "history", messages: msgs });
       })
+      .catch((e) => send({ tag: cmd.tag, type: "error", error: String(e) }));
+  } else if (cmd.cmd === "usage" && cmd.session) {
+    // Token/cost usage: sum message costs, take the latest context size.
+    client.session
+      .messages({ path: { id: cmd.session } })
+      .then((res) => {
+        let cost = 0, input = 0, output = 0, context = 0;
+        for (const m of res.data || []) {
+          const t = m.info?.tokens;
+          if (t) {
+            cost += m.info.cost || 0;
+            input += t.input || 0;
+            output += t.output || 0;
+            context = (t.input || 0) + (t.cache?.read || 0) + (t.cache?.write || 0);
+          }
+        }
+        send({ tag: cmd.tag, type: "usage", cost, input, output, context });
+      })
+      .catch((e) => send({ tag: cmd.tag, type: "usage", error: String(e) }));
+  } else if (cmd.cmd === "compact" && cmd.session) {
+    // Compact (summarize) the session to shrink the context.
+    const model = cmd.model || MODEL;
+    client.session
+      .summarize({ path: { id: cmd.session }, body: { providerID: model.providerID, modelID: model.modelID } })
+      .then(() => send({ tag: cmd.tag, type: "compacted" }))
       .catch((e) => send({ tag: cmd.tag, type: "error", error: String(e) }));
   } else if (cmd.cmd === "edit_done") {
     // Neovim finished applying an edit; unblock the loupe_write tool that's waiting.
