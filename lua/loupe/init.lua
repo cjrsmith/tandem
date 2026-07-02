@@ -31,7 +31,17 @@ vim.api.nvim_set_hl(0, "LoupeBorderDim", { link = "Comment", default = true })
 -- replies look in opencode / claude. Treesitter when available, else built-in syntax.
 local function style_markdown(buf, win)
 	vim.bo[buf].filetype = "markdown"
-	pcall(vim.treesitter.start, buf, "markdown")
+	pcall(vim.treesitter.start, buf, "markdown") -- base highlighting / fallback
+	-- If the user runs render-markdown.nvim, give Loupe's floats the SAME rich render
+	-- as opencode/claude (styled headings, bullets, code-block backgrounds, concealed
+	-- markers). Setting ft fires FileType so the plugin normally auto-attaches, but a
+	-- lazy-loaded plugin can miss a float that isn't the current buffer — so attach this
+	-- buffer explicitly. pcall keeps us safe if the plugin is absent or its API shifts.
+	pcall(function()
+		local mgr = require("render-markdown.core.manager")
+		mgr.attach(buf)
+		mgr.set_buf(buf, true)
+	end)
 	if win and vim.api.nvim_win_is_valid(win) then
 		vim.wo[win].wrap = true
 		vim.wo[win].linebreak = true
