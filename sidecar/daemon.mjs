@@ -22,7 +22,7 @@ import os from "node:os";
 import path from "node:path";
 
 const MODEL = { providerID: "opencode", modelID: "north-mini-code-free" };
-const VERSION = "2026-07-02 usage+compact+claude-backend+journal";
+const VERSION = "2026-07-03 tool-permissions";
 
 // loupe_instruct: the Navigator gives the human ONE directive (a next step). Sticky,
 // non-blocking — shown in the notification bar until dismissed / next asked.
@@ -289,8 +289,29 @@ await new Promise((r) => bridge.listen(0, "127.0.0.1", r));
 process.env.LOUPE_BRIDGE_PORT = String(bridge.address().port);
 debug("loupe bridge on", bridge.address().port);
 
-const { client, server } = await createOpencode({ port: 0 });
+// Gate side-effecting native tools behind a human OK (bash, webfetch). Reads/greps
+// stay auto-allowed; Loupe's own tools have their own gate (the typewriter). This
+// makes OpenCode raise permission.updated events we relay to the editor.
+const { client, server } = await createOpencode({
+  port: 0,
+  config: { permission: { bash: "ask", webfetch: "ask" } },
+});
 debug("daemon up at", server.url);
+
+// ── Tool-permission bridge ──────────────────────────────────────
+// Both backends funnel "may I run this tool?" through here: we ask the editor and
+// block until the human answers once / always / reject. `permission_reply` (stdin)
+// resolves the waiting promise. Shared by the OpenCode event handler below and the
+// Claude backend's canUseTool.
+const pendingPermissions = new Map(); // id -> resolve
+let permN = 0;
+function requestPermission({ tool, command }) {
+  return new Promise((resolve) => {
+    const id = "perm" + ++permN;
+    pendingPermissions.set(id, resolve);
+    send({ type: "permission", id, tool, command: command || "" });
+  });
+}
 function shutdown(code) {
   try { bridge.close(); } catch {}
   try { server.close(); } catch {}
@@ -327,6 +348,21 @@ const events = await client.event.subscribe();
 (async () => {
   for await (const event of events.stream) {
     const p = event.properties || {};
+    // Permission asks arrive as their own event (not tied to a streaming request):
+    // ask the editor, then reply once/always/reject. Handle before the `active` guard.
+    if (event.type === "permission.updated" && p.id && p.sessionID) {
+      const command =
+        (p.metadata && (p.metadata.command || p.metadata.cmd || p.metadata.url)) || p.title || p.type;
+      requestPermission({ tool: p.type, command: String(command) }).then((decision) => {
+        client
+          .postSessionIdPermissionsPermissionId({
+            path: { id: p.sessionID, permissionID: p.id },
+            body: { response: decision === "always" ? "always" : decision === "reject" ? "reject" : "once" },
+          })
+          .catch((e) => debug("permission reply error", e));
+      });
+      continue;
+    }
     const req = active.get(p.sessionID);
     if (!req) continue;
     if (event.type === "message.part.updated" && p.part) {
@@ -395,7 +431,7 @@ let claudeBackend = null;
 async function getClaude() {
   if (!claudeBackend) {
     const { createClaudeBackend } = await import("./backends/claude.mjs");
-    claudeBackend = createClaudeBackend({ send, cwd: process.cwd(), defaultSystem: SYSTEM });
+    claudeBackend = createClaudeBackend({ send, cwd: process.cwd(), defaultSystem: SYSTEM, requestPermission });
   }
   return claudeBackend;
 }
@@ -481,6 +517,13 @@ rl.on("line", (line) => {
       pendingEdits.delete(cmd.id);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ message: cmd.message || "applied" }));
+    }
+  } else if (cmd.cmd === "permission_reply") {
+    // Neovim answered a tool-permission ask (once / always / reject).
+    const resolve = pendingPermissions.get(cmd.id);
+    if (resolve) {
+      pendingPermissions.delete(cmd.id);
+      resolve(cmd.decision || "reject");
     }
   } else if (cmd.cmd === "shutdown") {
     shutdown(0);

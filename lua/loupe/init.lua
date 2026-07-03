@@ -1100,6 +1100,8 @@ local function on_stdout(_, data)
 					M.on_journal(msg) -- loupe_journal tool — curate the workpackage brief
 				elseif msg.type == "backlog" then
 					M.on_backlog(msg) -- loupe_backlog tool — add/complete tasks
+				elseif msg.type == "permission" then
+					M.on_permission(msg) -- a side-effecting tool wants to run — ask first
 				elseif msg.type == "status" then
 					M.on_status(msg) -- one-line "what the AI is doing now"
 				elseif daemon.handlers[msg.tag] then
@@ -1544,6 +1546,29 @@ function M.on_notify(msg)
 	if msg.message and msg.message ~= "" then
 		M.toast(msg.message)
 	end
+end
+
+-- A side-effecting tool (bash, webfetch, …) wants to run. Ask before it does —
+-- allow once / allow always (this daemon run) / reject. Dismissing rejects (safe
+-- default: never run a command you didn't approve). Reads/greps + Loupe's own tools
+-- are auto-allowed by the daemon and never reach here.
+function M.on_permission(msg)
+	local tool = msg.tool or "a tool"
+	local command = msg.command or ""
+	vim.schedule(function()
+		local label = (command ~= "" and command ~= tool) and (tool .. " · " .. command) or tool
+		vim.ui.select({ "Allow once", "Allow always (this session)", "Reject" }, {
+			prompt = "Loupe — run  " .. label .. "  ?",
+		}, function(choice)
+			local decision = "reject"
+			if choice == "Allow once" then
+				decision = "once"
+			elseif choice and choice:match("^Allow always") then
+				decision = "always"
+			end
+			send_cmd({ cmd = "permission_reply", id = msg.id, decision = decision })
+		end)
+	end)
 end
 
 -- The Navigator's loupe_instruct tool: a directive (next step for you). Opens a

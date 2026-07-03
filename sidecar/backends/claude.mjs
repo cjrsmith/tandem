@@ -112,6 +112,8 @@ const LOUPE_TOOLS = [
 ].map((t) => "mcp__loupe__" + t);
 const WRITE_TOOLS = ["mcp__loupe__loupe_write", "mcp__loupe__loupe_region"];
 const NATIVE_WRITERS = ["Write", "Edit", "MultiEdit", "NotebookEdit"];
+// Auto-allowed (read-only, harmless) native tools — no permission prompt.
+const SAFE_TOOLS = new Set(["Read", "Grep", "Glob", "NotebookRead", "TodoWrite"]);
 
 // A short "what the AI is doing now" label from a tool call (parallels toolLabel
 // in daemon.mjs; here we get MCP-prefixed names, so strip the prefix first).
@@ -140,15 +142,36 @@ function messageText(raw) {
   return content.filter((b) => b && b.type === "text" && b.text).map((b) => b.text).join("");
 }
 
-export function createClaudeBackend({ send, cwd, defaultSystem }) {
+export function createClaudeBackend({ send, cwd, defaultSystem, requestPermission }) {
   const bySession = new Map(); // sessionId -> AbortController (for cancel)
   const cost = new Map(); // sessionId -> accumulated total_cost_usd
+  const alwaysAllow = new Set(); // tools the user chose "always" for (this daemon run)
+
+  // Gate side-effecting native tools (bash, webfetch, …) through the editor. Loupe's
+  // own tools + read-only tools are auto-allowed; everything else asks once/always/reject.
+  async function canUseTool(toolName, input) {
+    if (toolName.startsWith("mcp__loupe__") || SAFE_TOOLS.has(toolName) || alwaysAllow.has(toolName)) {
+      return { behavior: "allow", updatedInput: input };
+    }
+    if (!requestPermission) {
+      return { behavior: "allow", updatedInput: input }; // no bridge → don't block
+    }
+    const command =
+      toolName === "Bash" ? input.command || "" : toolName === "WebFetch" ? input.url || "" : JSON.stringify(input).slice(0, 200);
+    const decision = await requestPermission({ tool: toolName, command: String(command) });
+    if (decision === "reject") {
+      return { behavior: "deny", message: "The user declined running " + toolName + "." };
+    }
+    if (decision === "always") alwaysAllow.add(toolName);
+    return { behavior: "allow", updatedInput: input };
+  }
 
   async function handlePrompt(cmd) {
     const abort = new AbortController();
     const readonly = cmd.agent === "plan"; // navigator/chat: guide only, no file writes
     const disallowed = [...NATIVE_WRITERS, ...(readonly ? WRITE_TOOLS : [])];
-    const allowed = [...LOUPE_TOOLS.filter((t) => !disallowed.includes(t)), "Read", "Grep", "Glob", "Bash"];
+    // Auto-allow Loupe's own tools + read-only tools; Bash/WebFetch go through canUseTool.
+    const allowed = [...LOUPE_TOOLS.filter((t) => !disallowed.includes(t)), "Read", "Grep", "Glob"];
 
     let resume = cmd.session || undefined;
     if (cmd.fork && cmd.session) {
@@ -167,8 +190,8 @@ export function createClaudeBackend({ send, cwd, defaultSystem }) {
         mcpServers: { loupe: loupeServer },
         allowedTools: allowed,
         disallowedTools: disallowed,
-        permissionMode: "bypassPermissions",
-        allowDangerouslySkipPermissions: true,
+        permissionMode: "default",
+        canUseTool,
         includePartialMessages: true,
         abortController: abort,
         env: { ...process.env },
