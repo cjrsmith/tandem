@@ -1,4 +1,4 @@
-// Loupe backend: Claude (via @anthropic-ai/claude-agent-sdk).
+// Tandem backend: Claude (via @anthropic-ai/claude-agent-sdk).
 //
 // A parallel implementation to the OpenCode path in daemon.mjs. It speaks the
 // SAME internal protocol the daemon uses toward Neovim (session / delta / status
@@ -6,7 +6,7 @@
 // doesn't care which backend produced them. The daemon dispatches to us whenever
 // a command carries backend:"claude".
 //
-// The loupe_* tools are exposed as an IN-PROCESS MCP server: their handlers run
+// The tandem_* tools are exposed as an IN-PROCESS MCP server: their handlers run
 // right here in the daemon and POST to the same HTTP bridge the OpenCode tools
 // use — so the typewriter / ask / notify / instruct plumbing is shared verbatim.
 //
@@ -24,7 +24,7 @@ import { z } from "zod";
 // POST to the daemon's local bridge (same endpoints the OpenCode tools use). The
 // bridge port is published on the environment by daemon.mjs before we're loaded.
 async function bridge(pathname, body) {
-  const port = process.env.LOUPE_BRIDGE_PORT;
+  const port = process.env.TANDEM_BRIDGE_PORT;
   if (!port) return {};
   const res = await fetch("http://127.0.0.1:" + port + pathname, {
     method: "POST",
@@ -35,32 +35,32 @@ async function bridge(pathname, body) {
 }
 const textResult = (t) => ({ content: [{ type: "text", text: t }] });
 
-// The five Loupe tools, mirroring the tool bodies deployed for OpenCode. As MCP
-// tools their model-visible names become mcp__loupe__loupe_write, etc.
-const loupeServer = createSdkMcpServer({
-  name: "loupe",
+// The five Tandem tools, mirroring the tool bodies deployed for OpenCode. As MCP
+// tools their model-visible names become mcp__tandem__tandem_write, etc.
+const tandemServer = createSdkMcpServer({
+  name: "tandem",
   version: "1.0.0",
   tools: [
     tool(
-      "loupe_write",
-      "Write code into the user's editor through Loupe. The ONLY way to create or modify a file; the human watches it typed in and can interrupt.",
+      "tandem_write",
+      "Write code into the user's editor through Tandem. The ONLY way to create or modify a file; the human watches it typed in and can interrupt.",
       { file: z.string().describe("Path of the file to create or edit"), content: z.string().describe("The complete new contents of the file") },
       async (a) => textResult((await bridge("/edit", { file: a.file, content: a.content })).message || "applied"),
     ),
     tool(
-      "loupe_region",
+      "tandem_region",
       "Replace the region of code the user has selected/marked in their editor. Return ONLY the replacement code for that region — NOT the whole file.",
       { code: z.string().describe("The replacement code for the selected region only") },
       async (a) => textResult((await bridge("/region", { code: a.code })).message || "applied"),
     ),
     tool(
-      "loupe_ask",
+      "tandem_ask",
       "Ask the user a question and wait for their answer. Use whenever you need a decision from them. Returns the user's answer.",
       { question: z.string().describe("The question to ask the user") },
       async (a) => textResult((await bridge("/ask", { question: a.question })).message || "(no answer)"),
     ),
     tool(
-      "loupe_notify",
+      "tandem_notify",
       "Briefly tell the user what you are doing or about to do (a short status line). Non-blocking. Use sparingly.",
       { message: z.string().describe("A short status message for the user") },
       async (a) => {
@@ -69,7 +69,7 @@ const loupeServer = createSdkMcpServer({
       },
     ),
     tool(
-      "loupe_instruct",
+      "tandem_instruct",
       "Give the human ONE directive — the next step for them to do (they write the code; you guide). Issue ONE instruction, then stop and wait.",
       { instruction: z.string().describe("A short, concrete next step for the human to do") },
       async (a) => {
@@ -78,7 +78,7 @@ const loupeServer = createSdkMcpServer({
       },
     ),
     tool(
-      "loupe_journal",
+      "tandem_journal",
       "Curate this workpackage's JOURNAL — a concise, always-current brief (goal, current state, key decisions, approach) injected into every session here. Pass the COMPLETE updated markdown; it replaces the old one. Keep it tight; update as decisions are made.",
       { content: z.string().describe("The complete updated journal markdown (a concise brief)") },
       async (a) => {
@@ -87,7 +87,7 @@ const loupeServer = createSdkMcpServer({
       },
     ),
     tool(
-      "loupe_backlog",
+      "tandem_backlog",
       "Update this workpackage's BACKLOG: add new concrete tasks and/or mark finished ones done. Does NOT rewrite the list, so the human's ordering is preserved.",
       {
         add: z.array(z.string()).optional().describe("New tasks to append (highest priority first)"),
@@ -101,16 +101,16 @@ const loupeServer = createSdkMcpServer({
   ],
 });
 
-const LOUPE_TOOLS = [
-  "loupe_write",
-  "loupe_region",
-  "loupe_ask",
-  "loupe_notify",
-  "loupe_instruct",
-  "loupe_journal",
-  "loupe_backlog",
-].map((t) => "mcp__loupe__" + t);
-const WRITE_TOOLS = ["mcp__loupe__loupe_write", "mcp__loupe__loupe_region"];
+const TANDEM_TOOLS = [
+  "tandem_write",
+  "tandem_region",
+  "tandem_ask",
+  "tandem_notify",
+  "tandem_instruct",
+  "tandem_journal",
+  "tandem_backlog",
+].map((t) => "mcp__tandem__" + t);
+const WRITE_TOOLS = ["mcp__tandem__tandem_write", "mcp__tandem__tandem_region"];
 const NATIVE_WRITERS = ["Write", "Edit", "MultiEdit", "NotebookEdit"];
 // Auto-allowed (read-only, harmless) native tools — no permission prompt.
 const SAFE_TOOLS = new Set(["Read", "Grep", "Glob", "NotebookRead", "TodoWrite"]);
@@ -118,17 +118,17 @@ const SAFE_TOOLS = new Set(["Read", "Grep", "Glob", "NotebookRead", "TodoWrite"]
 // A short "what the AI is doing now" label from a tool call (parallels toolLabel
 // in daemon.mjs; here we get MCP-prefixed names, so strip the prefix first).
 function toolLabel(name, input = {}) {
-  const bare = String(name).replace(/^mcp__loupe__/, "").replace(/^mcp__[^_]+__/, "");
+  const bare = String(name).replace(/^mcp__tandem__/, "").replace(/^mcp__[^_]+__/, "");
   const base = (s) => (typeof s === "string" && s ? s.split("/").pop() : "");
   switch (bare) {
     case "Read": return "reading " + (base(input.file_path) || "a file");
-    case "loupe_write": return "writing " + (base(input.file) || "a file");
-    case "loupe_region": return "editing the region";
+    case "tandem_write": return "writing " + (base(input.file) || "a file");
+    case "tandem_region": return "editing the region";
     case "Bash": return "running: " + String(input.command || "command").replace(/\s+/g, " ").slice(0, 40);
     case "Grep": return "searching" + (input.pattern ? ' "' + String(input.pattern).slice(0, 24) + '"' : "");
     case "Glob": return "finding files";
-    case "loupe_ask": return "asking you something";
-    case "loupe_notify": case "loupe_instruct": return "guiding you";
+    case "tandem_ask": return "asking you something";
+    case "tandem_notify": case "tandem_instruct": return "guiding you";
     default: return bare.replace(/_/g, " ");
   }
 }
@@ -147,10 +147,10 @@ export function createClaudeBackend({ send, cwd, defaultSystem, requestPermissio
   const cost = new Map(); // sessionId -> accumulated total_cost_usd
   const alwaysAllow = new Set(); // tools the user chose "always" for (this daemon run)
 
-  // Gate side-effecting native tools (bash, webfetch, …) through the editor. Loupe's
+  // Gate side-effecting native tools (bash, webfetch, …) through the editor. Tandem's
   // own tools + read-only tools are auto-allowed; everything else asks once/always/reject.
   async function canUseTool(toolName, input) {
-    if (toolName.startsWith("mcp__loupe__") || SAFE_TOOLS.has(toolName) || alwaysAllow.has(toolName)) {
+    if (toolName.startsWith("mcp__tandem__") || SAFE_TOOLS.has(toolName) || alwaysAllow.has(toolName)) {
       return { behavior: "allow", updatedInput: input };
     }
     if (!requestPermission) {
@@ -170,8 +170,8 @@ export function createClaudeBackend({ send, cwd, defaultSystem, requestPermissio
     const abort = new AbortController();
     const readonly = cmd.agent === "plan"; // navigator/chat: guide only, no file writes
     const disallowed = [...NATIVE_WRITERS, ...(readonly ? WRITE_TOOLS : [])];
-    // Auto-allow Loupe's own tools + read-only tools; Bash/WebFetch go through canUseTool.
-    const allowed = [...LOUPE_TOOLS.filter((t) => !disallowed.includes(t)), "Read", "Grep", "Glob"];
+    // Auto-allow Tandem's own tools + read-only tools; Bash/WebFetch go through canUseTool.
+    const allowed = [...TANDEM_TOOLS.filter((t) => !disallowed.includes(t)), "Read", "Grep", "Glob"];
 
     let resume = cmd.session || undefined;
     if (cmd.fork && cmd.session) {
@@ -187,7 +187,7 @@ export function createClaudeBackend({ send, cwd, defaultSystem, requestPermissio
         resume,
         cwd,
         systemPrompt: cmd.system || defaultSystem,
-        mcpServers: { loupe: loupeServer },
+        mcpServers: { tandem: tandemServer },
         allowedTools: allowed,
         disallowedTools: disallowed,
         permissionMode: "default",

@@ -1,7 +1,7 @@
-// Loupe sidecar — the OpenCode backend adapter.
+// Tandem sidecar — the OpenCode backend adapter.
 // Boots an OpenCode server via the official SDK, sends a prompt, and streams the
 // assistant's reply to stdout as one JSON object per line (the protocol Neovim
-// reads). Set LOUPE_DEBUG=1 for stderr diagnostics (never pollutes stdout).
+// reads). Set TANDEM_DEBUG=1 for stderr diagnostics (never pollutes stdout).
 //
 // Protocol (stdout, one JSON object per line):
 //   {"type":"session","id":"ses_…"}   session created
@@ -19,7 +19,7 @@ function emit(obj) {
   process.stdout.write(JSON.stringify(obj) + "\n");
 }
 function debug(...a) {
-  if (process.env.LOUPE_DEBUG) process.stderr.write(a.map(String).join(" ") + "\n");
+  if (process.env.TANDEM_DEBUG) process.stderr.write(a.map(String).join(" ") + "\n");
 }
 
 // port: 0 → a random free port, so concurrent/repeated runs never collide.

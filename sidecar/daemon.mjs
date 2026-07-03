@@ -1,4 +1,4 @@
-// Loupe persistent sidecar (daemon).
+// Tandem persistent sidecar (daemon).
 // Boots ONE OpenCode server and stays alive, handling many prompts across many
 // sessions over stdin/stdout. This is what gives the bubble real memory: a
 // session id can be reused, so its conversation history accumulates.
@@ -24,9 +24,9 @@ import path from "node:path";
 const MODEL = { providerID: "opencode", modelID: "north-mini-code-free" };
 const VERSION = "2026-07-03 tool-permissions";
 
-// loupe_instruct: the Navigator gives the human ONE directive (a next step). Sticky,
+// tandem_instruct: the Navigator gives the human ONE directive (a next step). Sticky,
 // non-blocking — shown in the notification bar until dismissed / next asked.
-const LOUPE_INSTRUCT_TOOL = `import { tool } from "@opencode-ai/plugin"
+const TANDEM_INSTRUCT_TOOL = `import { tool } from "@opencode-ai/plugin"
 
 export default tool({
   description: "Give the human ONE directive — the next step for them to do (they write the code; you guide). It appears in their notification bar and stays until they dismiss it or ask for the next step. Issue ONE instruction, then stop and wait — do not dump multiple steps at once.",
@@ -34,8 +34,8 @@ export default tool({
     instruction: tool.schema.string().describe("A short, concrete next step for the human to do"),
   },
   async execute(args) {
-    const port = process.env.LOUPE_BRIDGE_PORT
-    if (!port) return "loupe_instruct is only available inside the Loupe editor."
+    const port = process.env.TANDEM_BRIDGE_PORT
+    if (!port) return "tandem_instruct is only available inside the Tandem editor."
     await fetch("http://127.0.0.1:" + port + "/instruct", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -46,11 +46,11 @@ export default tool({
 })
 `;
 
-// loupe_journal: curate the workpackage's shared JOURNAL (a concise living brief —
+// tandem_journal: curate the workpackage's shared JOURNAL (a concise living brief —
 // goal, current state, key decisions, approach). Replaces the journal with the given
 // markdown. The journal is injected into every session in this workpackage, so keep it
-// tight. loupe_backlog: add tasks and/or tick off finished ones.
-const LOUPE_JOURNAL_TOOL = `import { tool } from "@opencode-ai/plugin"
+// tight. tandem_backlog: add tasks and/or tick off finished ones.
+const TANDEM_JOURNAL_TOOL = `import { tool } from "@opencode-ai/plugin"
 
 export default tool({
   description: "Curate this workpackage's JOURNAL — a concise, always-current brief (goal, current state, key decisions, approach & constraints) that is injected into every session here. Pass the COMPLETE updated journal markdown; it replaces the old one. Keep it tight: capture decisions and context, not a play-by-play. Update it as decisions are made or the state changes.",
@@ -58,8 +58,8 @@ export default tool({
     content: tool.schema.string().describe("The complete updated journal markdown (a concise brief)"),
   },
   async execute(args) {
-    const port = process.env.LOUPE_BRIDGE_PORT
-    if (!port) return "loupe_journal is only available inside the Loupe editor."
+    const port = process.env.TANDEM_BRIDGE_PORT
+    if (!port) return "tandem_journal is only available inside the Tandem editor."
     await fetch("http://127.0.0.1:" + port + "/journal", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -70,7 +70,7 @@ export default tool({
 })
 `;
 
-const LOUPE_BACKLOG_TOOL = `import { tool } from "@opencode-ai/plugin"
+const TANDEM_BACKLOG_TOOL = `import { tool } from "@opencode-ai/plugin"
 
 export default tool({
   description: "Update this workpackage's BACKLOG: add new concrete tasks and/or mark finished ones done. Does NOT rewrite the list, so the human's ordering and edits are preserved. Add tasks as you identify them from planning; tick items off as you complete them.",
@@ -79,8 +79,8 @@ export default tool({
     complete: tool.schema.array(tool.schema.string()).optional().describe("Texts of existing tasks to mark done (matched by text)"),
   },
   async execute(args) {
-    const port = process.env.LOUPE_BRIDGE_PORT
-    if (!port) return "loupe_backlog is only available inside the Loupe editor."
+    const port = process.env.TANDEM_BRIDGE_PORT
+    if (!port) return "tandem_backlog is only available inside the Tandem editor."
     await fetch("http://127.0.0.1:" + port + "/backlog", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -91,10 +91,10 @@ export default tool({
 })
 `;
 
-// loupe_ask: ask the user a question and BLOCK until they answer (returned as the
-// tool result). loupe_notify: fire-and-forget status line. Both reach the user
+// tandem_ask: ask the user a question and BLOCK until they answer (returned as the
+// tool result). tandem_notify: fire-and-forget status line. Both reach the user
 // through the same bridge as the edit tools.
-const LOUPE_ASK_TOOL = `import { tool } from "@opencode-ai/plugin"
+const TANDEM_ASK_TOOL = `import { tool } from "@opencode-ai/plugin"
 
 export default tool({
   description: "Ask the user a question and wait for their answer. Use whenever you need a decision from them — a name, a choice between approaches, confirmation before a structural change. In low autonomy, ask often (before naming functions/variables/files or making structural choices). Returns the user's answer.",
@@ -102,8 +102,8 @@ export default tool({
     question: tool.schema.string().describe("The question to ask the user"),
   },
   async execute(args) {
-    const port = process.env.LOUPE_BRIDGE_PORT
-    if (!port) return "loupe_ask is only available inside the Loupe editor."
+    const port = process.env.TANDEM_BRIDGE_PORT
+    if (!port) return "tandem_ask is only available inside the Tandem editor."
     const res = await fetch("http://127.0.0.1:" + port + "/ask", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -115,7 +115,7 @@ export default tool({
 })
 `;
 
-const LOUPE_NOTIFY_TOOL = `import { tool } from "@opencode-ai/plugin"
+const TANDEM_NOTIFY_TOOL = `import { tool } from "@opencode-ai/plugin"
 
 export default tool({
   description: "Briefly tell the user what you are doing or about to do (a short status line). Non-blocking: it shows a small notification and returns immediately. Use for significant steps, sparingly.",
@@ -123,8 +123,8 @@ export default tool({
     message: tool.schema.string().describe("A short status message for the user"),
   },
   async execute(args) {
-    const port = process.env.LOUPE_BRIDGE_PORT
-    if (!port) return "loupe_notify is only available inside the Loupe editor."
+    const port = process.env.TANDEM_BRIDGE_PORT
+    if (!port) return "tandem_notify is only available inside the Tandem editor."
     await fetch("http://127.0.0.1:" + port + "/notify", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -135,10 +135,10 @@ export default tool({
 })
 `;
 
-// loupe_region: replace just the region the user selected/marked. Returns ONLY that
-// region's code (not the whole file) — Loupe places it between the marks while the
-// user can keep editing elsewhere. Posts to the same bridge as loupe_write.
-const LOUPE_REGION_TOOL = `import { tool } from "@opencode-ai/plugin"
+// tandem_region: replace just the region the user selected/marked. Returns ONLY that
+// region's code (not the whole file) — Tandem places it between the marks while the
+// user can keep editing elsewhere. Posts to the same bridge as tandem_write.
+const TANDEM_REGION_TOOL = `import { tool } from "@opencode-ai/plugin"
 
 export default tool({
   description: "Replace the region of code the user has selected/marked in their editor. Return ONLY the replacement code for that region — NOT the whole file. Use this whenever the user asks you to implement, fill in, or change a selected region.",
@@ -146,8 +146,8 @@ export default tool({
     code: tool.schema.string().describe("The replacement code for the selected region only"),
   },
   async execute(args) {
-    const port = process.env.LOUPE_BRIDGE_PORT
-    if (!port) return "loupe_region is only available inside the Loupe editor."
+    const port = process.env.TANDEM_BRIDGE_PORT
+    if (!port) return "tandem_region is only available inside the Tandem editor."
     const res = await fetch("http://127.0.0.1:" + port + "/region", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -159,21 +159,21 @@ export default tool({
 })
 `;
 
-// The loupe_write tool source. Deployed (below) into a Loupe-owned opencode config
+// The tandem_write tool source. Deployed (below) into a Tandem-owned opencode config
 // dir so the model can call it in ANY project. Instead of writing to disk, it POSTs
 // the edit to the daemon's bridge, which relays to Neovim's typewriter. The `await
 // fetch` blocks until Neovim is done — the suspension point for interrupt/resume.
-const LOUPE_WRITE_TOOL = `import { tool } from "@opencode-ai/plugin"
+const TANDEM_WRITE_TOOL = `import { tool } from "@opencode-ai/plugin"
 
 export default tool({
-  description: "Write code into the user's editor through Loupe. The ONLY way to create or modify a file; the human watches it typed in and can interrupt. Only works inside the Loupe Neovim plugin.",
+  description: "Write code into the user's editor through Tandem. The ONLY way to create or modify a file; the human watches it typed in and can interrupt. Only works inside the Tandem Neovim plugin.",
   args: {
     file: tool.schema.string().describe("Path of the file to create or edit"),
     content: tool.schema.string().describe("The complete new contents of the file"),
   },
   async execute(args) {
-    const port = process.env.LOUPE_BRIDGE_PORT
-    if (!port) return "loupe_write is only available inside the Loupe editor; use the normal edit tools instead."
+    const port = process.env.TANDEM_BRIDGE_PORT
+    if (!port) return "tandem_write is only available inside the Tandem editor; use the normal edit tools instead."
     const res = await fetch("http://127.0.0.1:" + port + "/edit", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -186,11 +186,11 @@ export default tool({
 `;
 
 // The structured-output contract (§3.13). Makes the model mark code meant for the
-// file so Loupe can route it (e.g. to ghost text) instead of leaving it as prose.
+// file so Tandem can route it (e.g. to ghost text) instead of leaving it as prose.
 const SYSTEM = [
   "You are assisting inside a code editor; the user reads your reply in a small chat bubble.",
   "When part of your answer is concrete code the user could insert into their current file,",
-  "wrap ONLY that code in <loupe:suggest> and </loupe:suggest> tags, each tag on its own line.",
+  "wrap ONLY that code in <tandem:suggest> and </tandem:suggest> tags, each tag on its own line.",
   "Keep ALL explanation as normal prose OUTSIDE the tags.",
   "Do NOT tag tiny inline snippets that are part of a sentence — only standalone code blocks meant for the file.",
 ].join("\n");
@@ -199,22 +199,22 @@ function send(obj) {
   process.stdout.write(JSON.stringify(obj) + "\n");
 }
 function debug(...a) {
-  if (process.env.LOUPE_DEBUG) process.stderr.write(a.map(String).join(" ") + "\n");
+  if (process.env.TANDEM_DEBUG) process.stderr.write(a.map(String).join(" ") + "\n");
 }
 
-// ── loupe_write deployment + edit bridge (must precede createOpencode) ──
-// Deploy the tool into a Loupe-OWNED config dir; OPENCODE_CONFIG_DIR keeps the
+// ── tandem_write deployment + edit bridge (must precede createOpencode) ──
+// Deploy the tool into a Tandem-OWNED config dir; OPENCODE_CONFIG_DIR keeps the
 // user's model auth working (verified) without touching project/global config.
-const LOUPE_CFG_DIR = path.join(os.homedir(), ".cache", "loupe", "opencode");
-fs.mkdirSync(path.join(LOUPE_CFG_DIR, "tools"), { recursive: true });
-fs.writeFileSync(path.join(LOUPE_CFG_DIR, "tools", "loupe_write.js"), LOUPE_WRITE_TOOL);
-fs.writeFileSync(path.join(LOUPE_CFG_DIR, "tools", "loupe_region.js"), LOUPE_REGION_TOOL);
-fs.writeFileSync(path.join(LOUPE_CFG_DIR, "tools", "loupe_ask.js"), LOUPE_ASK_TOOL);
-fs.writeFileSync(path.join(LOUPE_CFG_DIR, "tools", "loupe_notify.js"), LOUPE_NOTIFY_TOOL);
-fs.writeFileSync(path.join(LOUPE_CFG_DIR, "tools", "loupe_instruct.js"), LOUPE_INSTRUCT_TOOL);
-fs.writeFileSync(path.join(LOUPE_CFG_DIR, "tools", "loupe_journal.js"), LOUPE_JOURNAL_TOOL);
-fs.writeFileSync(path.join(LOUPE_CFG_DIR, "tools", "loupe_backlog.js"), LOUPE_BACKLOG_TOOL);
-process.env.OPENCODE_CONFIG_DIR = LOUPE_CFG_DIR;
+const TANDEM_CFG_DIR = path.join(os.homedir(), ".cache", "tandem", "opencode");
+fs.mkdirSync(path.join(TANDEM_CFG_DIR, "tools"), { recursive: true });
+fs.writeFileSync(path.join(TANDEM_CFG_DIR, "tools", "tandem_write.js"), TANDEM_WRITE_TOOL);
+fs.writeFileSync(path.join(TANDEM_CFG_DIR, "tools", "tandem_region.js"), TANDEM_REGION_TOOL);
+fs.writeFileSync(path.join(TANDEM_CFG_DIR, "tools", "tandem_ask.js"), TANDEM_ASK_TOOL);
+fs.writeFileSync(path.join(TANDEM_CFG_DIR, "tools", "tandem_notify.js"), TANDEM_NOTIFY_TOOL);
+fs.writeFileSync(path.join(TANDEM_CFG_DIR, "tools", "tandem_instruct.js"), TANDEM_INSTRUCT_TOOL);
+fs.writeFileSync(path.join(TANDEM_CFG_DIR, "tools", "tandem_journal.js"), TANDEM_JOURNAL_TOOL);
+fs.writeFileSync(path.join(TANDEM_CFG_DIR, "tools", "tandem_backlog.js"), TANDEM_BACKLOG_TOOL);
+process.env.OPENCODE_CONFIG_DIR = TANDEM_CFG_DIR;
 
 const pendingEdits = new Map(); // editID -> pending http response (the blocked tool)
 let editN = 0;
@@ -286,11 +286,11 @@ const bridge = http.createServer((req, res) => {
   }
 });
 await new Promise((r) => bridge.listen(0, "127.0.0.1", r));
-process.env.LOUPE_BRIDGE_PORT = String(bridge.address().port);
-debug("loupe bridge on", bridge.address().port);
+process.env.TANDEM_BRIDGE_PORT = String(bridge.address().port);
+debug("tandem bridge on", bridge.address().port);
 
 // Gate side-effecting native tools behind a human OK (bash, webfetch). Reads/greps
-// stay auto-allowed; Loupe's own tools have their own gate (the typewriter). This
+// stay auto-allowed; Tandem's own tools have their own gate (the typewriter). This
 // makes OpenCode raise permission.updated events we relay to the editor.
 const { client, server } = await createOpencode({
   port: 0,
@@ -333,7 +333,7 @@ function toolLabel(tool, input = {}) {
   const base = (s) => (typeof s === "string" && s ? s.split("/").pop() : "");
   switch (tool) {
     case "read": return "reading " + (base(input.filePath || input.path) || "a file");
-    case "write": case "edit": case "apply_patch": case "loupe_write":
+    case "write": case "edit": case "apply_patch": case "tandem_write":
       return "writing " + (base(input.file || input.filePath) || "a file");
     case "bash": return "running: " + String(input.command || input.description || "command").replace(/\s+/g, " ").slice(0, 40);
     case "grep": return "searching" + (input.pattern ? ' "' + String(input.pattern).slice(0, 24) + '"' : "");
@@ -511,7 +511,7 @@ rl.on("line", (line) => {
       .then(() => send({ tag: cmd.tag, type: "compacted" }))
       .catch((e) => send({ tag: cmd.tag, type: "error", error: String(e) }));
   } else if (cmd.cmd === "edit_done") {
-    // Neovim finished applying an edit; unblock the loupe_write tool that's waiting.
+    // Neovim finished applying an edit; unblock the tandem_write tool that's waiting.
     const res = pendingEdits.get(cmd.id);
     if (res) {
       pendingEdits.delete(cmd.id);

@@ -1,42 +1,42 @@
 local M = {}
 
-local ns = vim.api.nvim_create_namespace("loupe")
-local edit_ns = vim.api.nvim_create_namespace("loupe_edit") -- the "AI is writing here" highlight
+local ns = vim.api.nvim_create_namespace("tandem")
+local edit_ns = vim.api.nvim_create_namespace("tandem_edit") -- the "AI is writing here" highlight
 -- Region markers live in their OWN namespace so a running typewriter's clear_edit
 -- (which wipes edit_ns) can't erase a still-PENDING region's marks. This is what lets
 -- several region requests be armed at once (select A, ask; select B, ask; …).
-local region_ns = vim.api.nvim_create_namespace("loupe_region")
+local region_ns = vim.api.nvim_create_namespace("tandem_region")
 
 -- Diff-style highlight over the region the AI is actively typing into. `default`
 -- so a user colourscheme can override it.
 -- Subtle blue/grey wash over the region the AI is writing.
-vim.api.nvim_set_hl(0, "LoupeActiveEdit", { bg = "#2d3446" })
-vim.api.nvim_set_hl(0, "LoupeImplementing", { link = "Comment", default = true })
+vim.api.nvim_set_hl(0, "TandemActiveEdit", { bg = "#2d3446" })
+vim.api.nvim_set_hl(0, "TandemImplementing", { link = "Comment", default = true })
 local IMPL_LABEL = "⟨ implementing… ⟩" -- the marker shown above & below the AI's region
 
-local chat_ns = vim.api.nvim_create_namespace("loupe_chat") -- user-message backgrounds
+local chat_ns = vim.api.nvim_create_namespace("tandem_chat") -- user-message backgrounds
 -- Subtle grey block behind YOUR messages in chat (like opencode/claude); overridable.
-vim.api.nvim_set_hl(0, "LoupeUserMsg", { bg = "#2b2b33", default = true })
+vim.api.nvim_set_hl(0, "TandemUserMsg", { bg = "#2b2b33", default = true })
 
--- Mark a window as a Loupe surface (chat bubble / ask / instruction / command centre)
+-- Mark a window as a Tandem surface (chat bubble / ask / instruction / command centre)
 -- so M.toggle_focus can cycle between them and your code without closing anything.
 local function mark_surface(win)
-	pcall(vim.api.nvim_win_set_var, win, "loupe_surface", true)
+	pcall(vim.api.nvim_win_set_var, win, "tandem_surface", true)
 end
 local function is_surface(win)
-	local ok, v = pcall(vim.api.nvim_win_get_var, win, "loupe_surface")
+	local ok, v = pcall(vim.api.nvim_win_get_var, win, "tandem_surface")
 	return ok and v == true
 end
 -- Shared border highlights so bubbles and the command centre look the same.
-vim.api.nvim_set_hl(0, "LoupeBorderActive", { link = "Function", default = true })
-vim.api.nvim_set_hl(0, "LoupeBorderDim", { link = "Comment", default = true })
+vim.api.nvim_set_hl(0, "TandemBorderActive", { link = "Function", default = true })
+vim.api.nvim_set_hl(0, "TandemBorderDim", { link = "Comment", default = true })
 
 -- Render a buffer's content as markdown (highlighting + inline conceal), the way
 -- replies look in opencode / claude. Treesitter when available, else built-in syntax.
 local function style_markdown(buf, win)
 	vim.bo[buf].filetype = "markdown"
 	pcall(vim.treesitter.start, buf, "markdown") -- base highlighting / fallback
-	-- If the user runs render-markdown.nvim, give Loupe's floats the SAME rich render
+	-- If the user runs render-markdown.nvim, give Tandem's floats the SAME rich render
 	-- as opencode/claude (styled headings, bullets, code-block backgrounds, concealed
 	-- markers). Setting ft fires FileType so the plugin normally auto-attaches, but a
 	-- lazy-loaded plugin can miss a float that isn't the current buffer — so attach this
@@ -81,7 +81,7 @@ end
 -- (it just means the next session runs on the other backend).
 function M.pick_model()
 	vim.ui.select(M.models, {
-		prompt = "Loupe model:",
+		prompt = "Tandem model:",
 		format_item = function(m)
 			return m.label .. "  (" .. (m.backend or "opencode") .. ")"
 		end,
@@ -94,7 +94,7 @@ function M.pick_model()
 				-- session on the new backend in this workpackage (reuse or create).
 				pcall(M.switch_backend, choice.backend)
 			end
-			vim.notify("Loupe model → " .. choice.label .. (switched and ("  [" .. choice.backend .. "]") or ""))
+			vim.notify("Tandem model → " .. choice.label .. (switched and ("  [" .. choice.backend .. "]") or ""))
 			M.rail_refresh()
 		end
 	end)
@@ -106,11 +106,11 @@ M.granularity = "word" -- char | word | line | paragraph — pace for typed-in e
 -- Pick how fast typed-in edits land (the granularity dial).
 function M.pick_granularity()
 	vim.ui.select({ "char", "word", "line", "paragraph" }, {
-		prompt = "Loupe typing granularity:",
+		prompt = "Tandem typing granularity:",
 	}, function(choice)
 		if choice then
 			M.granularity = choice
-			vim.notify("Loupe granularity → " .. choice)
+			vim.notify("Tandem granularity → " .. choice)
 			M.rail_refresh()
 		end
 	end)
@@ -119,8 +119,20 @@ end
 -- (M.new_session lives with the workpackage/session code below — it adds a fresh
 -- session to the ACTIVE workpackage.)
 
+-- One-time migration: the project was renamed Loupe → Tandem. Earlier runs stored
+-- per-project runtime state (workpackages, journals, backlog, sessions) under .loupe/;
+-- move it to .tandem/ so nothing is lost.
+function M.migrate_from_loupe()
+	local old = vim.fn.getcwd() .. "/.loupe"
+	local new = vim.fn.getcwd() .. "/.tandem"
+	if vim.fn.isdirectory(old) == 1 and vim.fn.isdirectory(new) == 0 then
+		pcall(os.rename, old, new)
+	end
+end
+
 function M.setup(opts)
 	M.opts = opts or {}
+	pcall(M.migrate_from_loupe) -- Loupe → Tandem runtime-state migration
 	pcall(M.wp_load) -- adopt the active workpackage's session on startup
 end
 
@@ -147,13 +159,13 @@ local function clean_code(s)
 	return vim.trim(s)
 end
 
--- Pull file-bound code out of a reply. Prefers the <loupe:suggest> tag (with an
+-- Pull file-bound code out of a reply. Prefers the <tandem:suggest> tag (with an
 -- optional file="…" attribute). As a safety net, a DRIVER that forgot the tag but
 -- still fenced its code in ``` gets salvaged — so a momentary contract slip doesn't
 -- silently drop the edit. Returns raw code (or nil) + the target file (or nil).
 function M.extract_suggestion(acc)
-	local file = acc:match('<loupe:suggest[^>]*file="([^"]*)"')
-	local code = acc:match("<loupe:suggest[^>]*>(.-)</loupe:suggest>")
+	local file = acc:match('<tandem:suggest[^>]*file="([^"]*)"')
+	local code = acc:match("<tandem:suggest[^>]*>(.-)</tandem:suggest>")
 	return code, file
 end
 
@@ -211,7 +223,7 @@ function M.ghost_suggestion()
 		render_ghost(M.last_suggestion.code, M.last_suggestion.buf, M.last_suggestion.row)
 		return
 	end
-	vim.notify("Loupe: no suggestion")
+	vim.notify("Tandem: no suggestion")
 end
 
 -- Dismiss the ghosted suggestion.
@@ -227,7 +239,7 @@ end
 function M.accept_suggestion(opts)
 	local s = M.last_suggestion
 	if not s then
-		vim.notify("Loupe: no suggestion")
+		vim.notify("Tandem: no suggestion")
 		return
 	end
 	M.clear_suggestion() -- remove the ghost preview
@@ -289,10 +301,10 @@ local function mark_refresh()
 		id = stream.top_mark,
 		right_gravity = false,
 		virt_lines_above = true,
-		virt_lines = { { { IMPL_LABEL, "LoupeImplementing" } } },
+		virt_lines = { { { IMPL_LABEL, "TandemImplementing" } } },
 		end_row = br,
 		end_col = 0,
-		hl_group = "LoupeActiveEdit",
+		hl_group = "TandemActiveEdit",
 		hl_eol = true,
 	})
 	M.active_edit = { buf = stream.buf, top = stream.top_mark, bot = stream.bot_mark, srow = tr, erow = br }
@@ -391,11 +403,11 @@ function M.type_out(text, opts)
 	stream.top_mark = vim.api.nvim_buf_set_extmark(stream.buf, edit_ns, row, col, {
 		right_gravity = false,
 		virt_lines_above = true,
-		virt_lines = { { { IMPL_LABEL, "LoupeImplementing" } } },
+		virt_lines = { { { IMPL_LABEL, "TandemImplementing" } } },
 	})
 	stream.bot_mark = vim.api.nvim_buf_set_extmark(stream.buf, edit_ns, row, col, {
 		right_gravity = true,
-		virt_lines = { { { IMPL_LABEL, "LoupeImplementing" } } },
+		virt_lines = { { { IMPL_LABEL, "TandemImplementing" } } },
 	})
 	M.active_edit = { buf = stream.buf, top = stream.top_mark, bot = stream.bot_mark, srow = row, erow = row }
 	start_timer()
@@ -426,11 +438,11 @@ function M.clear_edit()
 end
 
 -- Jump to wherever the AI is currently (or was last) writing code. Moves you into
--- a real code window — never a Loupe float — and centres on the edit.
+-- a real code window — never a Tandem float — and centres on the edit.
 function M.jump_to_edit()
 	local e = M.active_edit
 	if not e or not vim.api.nvim_buf_is_valid(e.buf) then
-		vim.notify("Loupe: no active edit to jump to")
+		vim.notify("Tandem: no active edit to jump to")
 		return
 	end
 	-- prefer a window already showing the edited buffer; else any normal window
@@ -445,7 +457,7 @@ function M.jump_to_edit()
 		end
 	end
 	if not target then
-		vim.notify("Loupe: no normal window to jump in")
+		vim.notify("Tandem: no normal window to jump in")
 		return
 	end
 	vim.api.nvim_set_current_win(target)
@@ -459,7 +471,7 @@ function M.jump_to_edit()
 end
 
 function M.bubble(lines)
-	lines = lines or { "Loupe 👁  — ask me anything" }
+	lines = lines or { "Tandem 👁  — ask me anything" }
 
 	-- 1. a scratch buffer to hold the bubble's contents
 	local buf = vim.api.nvim_create_buf(false, true) -- listed=false, scratch=true
@@ -507,10 +519,10 @@ function M.ask(on_submit, opts)
 		height = 1,
 		style = "minimal",
 		border = "rounded",
-		title = opts.title or " ask loupe ",
+		title = opts.title or " ask tandem ",
 		title_pos = "center",
 	})
-	vim.wo[win].winhighlight = "FloatBorder:LoupeBorderActive"
+	vim.wo[win].winhighlight = "FloatBorder:TandemBorderActive"
 	mark_surface(win)
 	vim.cmd("startinsert") -- drop straight into insert mode, ready to type
 
@@ -544,7 +556,7 @@ function M.chat()
 		height = 10, -- fixed height; scrolls past this
 		style = "minimal",
 		border = "rounded",
-		title = " loupe ",
+		title = " tandem ",
 		title_pos = "center",
 	})
 
@@ -554,7 +566,7 @@ function M.chat()
 			return
 		end
 		-- STUB reply (the model goes here later). Append above the next prompt.
-		vim.api.nvim_buf_set_lines(buf, -1, -1, false, { "loupe ▸ you said: " .. input, "" })
+		vim.api.nvim_buf_set_lines(buf, -1, -1, false, { "tandem ▸ you said: " .. input, "" })
 	end)
 
 	vim.cmd("startinsert")
@@ -574,7 +586,7 @@ local function get_visual_selection()
 end
 
 -- ── Shared panel: conversation + input + rail ───────────────────
--- The standard Loupe surface, used by BOTH the command centre (big, centred) and
+-- The standard Tandem surface, used by BOTH the command centre (big, centred) and
 -- located bubbles (small, at the cursor): a transcript pane (top-left), a "> " input
 -- pane (bottom-left), and the read-only attribute rail (right). Returns the buffers/
 -- windows + helpers; the caller wires what happens on submit. `box` carries the outer
@@ -615,7 +627,7 @@ local function make_panel(box, title_label)
 			relative = "editor", row = T + 1, col = L + LW + 1, width = RW - 2, height = Ht - 2,
 			style = "minimal", border = "rounded", focusable = false,
 		})
-		vim.wo[rail_win].winhighlight = "FloatBorder:LoupeBorderDim"
+		vim.wo[rail_win].winhighlight = "FloatBorder:TandemBorderDim"
 		mark_surface(rail_win)
 		M._rail_buf, M._rail_win = rail_buf, rail_win
 		M._rail_todo = box.todo ~= false -- bubbles omit the TO-DO panel (settings only)
@@ -650,8 +662,8 @@ local function make_panel(box, title_label)
 		vim.api.nvim_set_current_win(win)
 		for _, w in ipairs({ conv_win, input_win }) do
 			if vim.api.nvim_win_is_valid(w) then
-				vim.wo[w].winhighlight = (w == win) and "FloatBorder:LoupeBorderActive"
-					or "FloatBorder:LoupeBorderDim"
+				vim.wo[w].winhighlight = (w == win) and "FloatBorder:TandemBorderActive"
+					or "FloatBorder:TandemBorderDim"
 			end
 		end
 	end
@@ -687,7 +699,7 @@ local function make_panel(box, title_label)
 		local start = P.append(lines)
 		if start then
 			for i = start, start + n - 1 do
-				pcall(vim.api.nvim_buf_set_extmark, conv_buf, chat_ns, i, 0, { line_hl_group = "LoupeUserMsg" })
+				pcall(vim.api.nvim_buf_set_extmark, conv_buf, chat_ns, i, 0, { line_hl_group = "TandemUserMsg" })
 			end
 		end
 	end
@@ -716,7 +728,7 @@ local function make_panel(box, title_label)
 end
 
 -- Stream one turn through a panel: echo the user's line, render the model's reply
--- (markdown, loupe tags stripped) into the transcript, then call on_done(acc).
+-- (markdown, tandem tags stripped) into the transcript, then call on_done(acc).
 -- on_session(id) fires when the session id is learned; `fork` forks the session.
 local function panel_turn(P, session, user_text, prompt_text, on_session, on_done, fork, opts)
 	P.append_user(user_text)
@@ -744,12 +756,12 @@ local function panel_turn(P, session, user_text, prompt_text, on_session, on_don
 			end
 		elseif msg.type == "done" then
 			if r_start and vim.api.nvim_buf_is_valid(P.conv_buf) then
-				-- strip loupe tags but keep suggested code visible in the transcript
+				-- strip tandem tags but keep suggested code visible in the transcript
 				local display = vim.trim(acc
-					:gsub("<loupe:suggest[^>]*>(.-)</loupe:suggest>", "%1")
-					:gsub("<loupe:notify>.-</loupe:notify>", "")
-					:gsub("<loupe:ask>.-</loupe:ask>", "")
-					:gsub("<loupe:instruction>.-</loupe:instruction>", ""))
+					:gsub("<tandem:suggest[^>]*>(.-)</tandem:suggest>", "%1")
+					:gsub("<tandem:notify>.-</tandem:notify>", "")
+					:gsub("<tandem:ask>.-</tandem:ask>", "")
+					:gsub("<tandem:instruction>.-</tandem:instruction>", ""))
 				local lines = vim.split(vim.trim(display), "\n", { plain = true })
 				lines[#lines + 1] = ""
 				vim.api.nvim_buf_set_lines(P.conv_buf, r_start, r_start + r_count, false, lines)
@@ -831,7 +843,7 @@ function M.chat_here(mode, scope, opts)
 	local bubble_first_turn = true
 
 	-- the bubble: the SAME three-pane shape as the command centre, small + at cursor
-	local P = make_panel(cursor_box(), "loupe · " .. mode)
+	local P = make_panel(cursor_box(), "tandem · " .. mode)
 
 	vim.fn.prompt_setcallback(P.input_buf, function(input)
 		if input == "" then
@@ -864,15 +876,15 @@ function M.chat_here(mode, scope, opts)
 			-- (not a guessed name resolved against the wrong cwd).
 			local fname = vim.api.nvim_buf_get_name(origin.buf)
 			local where = (fname ~= "")
-				and ("I'm editing this file — use exactly this path with loupe_write: " .. fname .. "\n")
+				and ("I'm editing this file — use exactly this path with tandem_write: " .. fname .. "\n")
 				or ""
 			parts[#parts + 1] = where .. "Context (" .. context.label .. "):\n" .. context.text
 			-- Driver region edits: mark the target (in region_ns, so a concurrently-typing
 			-- edit can't wipe it) and ARM it on the FIFO queue. Several can be armed at once —
-			-- the Driver fills each via loupe_region, in order.
+			-- the Driver fills each via tandem_region, in order.
 			if M.role == "driver" then
 				local b = origin.buf
-				local label = { { { IMPL_LABEL, "LoupeImplementing" } } }
+				local label = { { { IMPL_LABEL, "TandemImplementing" } } }
 				if sel_range then
 					-- SELECTION → replace it (shown marked, since you clearly want an edit)
 					local last = vim.api.nvim_buf_get_lines(b, sel_range.erow, sel_range.erow + 1, false)[1] or ""
@@ -884,7 +896,7 @@ function M.chat_here(mode, scope, opts)
 					})
 					my_region = M.region_arm({ buf = b, top = top, bot = bot, kind = "replace" })
 					parts[#parts + 1] =
-						"IMPORTANT: implement this as a REGION edit. Call the loupe_region tool with ONLY the replacement code for the selected region — do not rewrite the whole file or use loupe_write."
+						"IMPORTANT: implement this as a REGION edit. Call the tandem_region tool with ONLY the replacement code for the selected region — do not rewrite the whole file or use tandem_write."
 				elseif scope == "line" then
 					-- CURSOR → insert at the cursor. No label yet (could be just a question);
 					-- markers appear once it actually writes.
@@ -894,7 +906,7 @@ function M.chat_here(mode, scope, opts)
 					local bot = vim.api.nvim_buf_set_extmark(b, region_ns, cr, #line, { right_gravity = true })
 					my_region = M.region_arm({ buf = b, top = top, bot = bot, kind = "insert" })
 					parts[#parts + 1] =
-						"There is an insertion point marked at my cursor. If I'm asking you to write or insert code, call the loupe_region tool with ONLY that code (it will be placed at the marked point — do not rewrite the whole file). If I'm only asking a question, just answer normally."
+						"There is an insertion point marked at my cursor. If I'm asking you to write or insert code, call the tandem_region tool with ONLY that code (it will be placed at the marked point — do not rewrite the whole file). If I'm only asking a question, just answer normally."
 				end
 			end
 		end
@@ -906,7 +918,7 @@ function M.chat_here(mode, scope, opts)
 			M.handle_tags(acc, get_session())
 			local code, file = M.extract_suggestion(acc)
 			if M.role == "driver" then
-				if code then -- Driver normally writes via loupe_write; stray tag still types
+				if code then -- Driver normally writes via tandem_write; stray tag still types
 					M.last_suggestion = { code = clean_code(code), buf = origin.buf, row = origin.row, file = file }
 					M.accept_suggestion()
 				end
@@ -916,14 +928,14 @@ function M.chat_here(mode, scope, opts)
 				local blocks = M.extract_blocks(acc)
 				if #blocks > 0 then
 					M.candidates = { blocks = blocks, buf = origin.buf, row = origin.row }
-					vim.notify(string.format("Loupe: %d code block%s — <leader>li to ghost", #blocks, #blocks > 1 and "s" or ""))
+					vim.notify(string.format("Tandem: %d code block%s — <leader>li to ghost", #blocks, #blocks > 1 and "s" or ""))
 				elseif code then -- legacy tag suggestion
 					M.last_suggestion = { code = clean_code(code), buf = origin.buf, row = origin.row, file = file }
-					vim.notify("Loupe: suggestion ready — <leader>li to ghost it")
+					vim.notify("Tandem: suggestion ready — <leader>li to ghost it")
 				end
 			end
 			-- this turn armed a region but the Driver never filled it (answered instead)
-			-- → withdraw it so it doesn't linger for a later loupe_region call
+			-- → withdraw it so it doesn't linger for a later tandem_region call
 			if my_region then
 				M.region_withdraw(my_region)
 				my_region = nil
@@ -939,10 +951,10 @@ function M.chat_here(mode, scope, opts)
 			end
 			for _, m in ipairs(messages) do
 				local txt = vim.trim((m.text or "")
-					:gsub("<loupe:suggest[^>]*>(.-)</loupe:suggest>", "%1")
-					:gsub("<loupe:notify>.-</loupe:notify>", "")
-					:gsub("<loupe:ask>.-</loupe:ask>", "")
-					:gsub("<loupe:instruction>.-</loupe:instruction>", ""))
+					:gsub("<tandem:suggest[^>]*>(.-)</tandem:suggest>", "%1")
+					:gsub("<tandem:notify>.-</tandem:notify>", "")
+					:gsub("<tandem:ask>.-</tandem:ask>", "")
+					:gsub("<tandem:instruction>.-</tandem:instruction>", ""))
 				if txt ~= "" then
 					if m.role == "user" then
 						P.append_user(txt)
@@ -991,7 +1003,10 @@ end
 -- 	return resp.data.id
 -- end
 
-local SIDECAR = vim.fn.expand("~/Projects/loupe/sidecar/sidecar.mjs")
+-- Plugin root, derived from THIS file's location (lua/tandem/init.lua → up 3), so the
+-- sidecar/agents paths work wherever the repo lives — no hardcoded project dir.
+local PLUGIN_ROOT = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h:h:h")
+local SIDECAR = PLUGIN_ROOT .. "/sidecar/sidecar.mjs"
 
 -- Run the sidecar with `prompt`; call on_delta(text) per chunk, on_done() at end.
 function M.ask_stream(prompt, on_delta, on_done)
@@ -1022,7 +1037,7 @@ function M.ask_bubble(prompt)
 		height = 12,
 		style = "minimal",
 		border = "rounded",
-		title = " loupe ",
+		title = " tandem ",
 		title_pos = "center",
 	})
 	local reply = ""
@@ -1054,7 +1069,7 @@ function M.ask_here()
 	end)
 end
 
-local DAEMON = vim.fn.expand("~/Projects/loupe/sidecar/daemon.mjs")
+local DAEMON = PLUGIN_ROOT .. "/sidecar/daemon.mjs"
 
 local daemon = {
 	job = nil,
@@ -1081,25 +1096,25 @@ local function on_stdout(_, data)
 				if msg.type == "ready" then
 					daemon.ready = true
                     M.daemon_version = msg.version
-                    vim.notify("Loupe daemon: " .. (msg.version or "unknown"))
+                    vim.notify("Tandem daemon: " .. (msg.version or "unknown"))
 					for _, c in ipairs(daemon.queue) do
 						vim.fn.chansend(daemon.job, vim.json.encode(c) .. "\n")
 					end
 					daemon.queue = {}
 				elseif msg.type == "edit" then
-					M.on_edit(msg) -- the agent's loupe_write tool wants to write a file
+					M.on_edit(msg) -- the agent's tandem_write tool wants to write a file
 				elseif msg.type == "region" then
-					M.on_region(msg) -- the agent's loupe_region tool — replace the marked region
+					M.on_region(msg) -- the agent's tandem_region tool — replace the marked region
 				elseif msg.type == "ask" then
-					M.on_ask(msg) -- the agent's loupe_ask tool — needs a decision from you
+					M.on_ask(msg) -- the agent's tandem_ask tool — needs a decision from you
 				elseif msg.type == "notify" then
-					M.on_notify(msg) -- the agent's loupe_notify tool — a status line
+					M.on_notify(msg) -- the agent's tandem_notify tool — a status line
 				elseif msg.type == "instruct" then
-					M.on_instruct(msg) -- the Navigator's loupe_instruct tool — a directive
+					M.on_instruct(msg) -- the Navigator's tandem_instruct tool — a directive
 				elseif msg.type == "journal" then
-					M.on_journal(msg) -- loupe_journal tool — curate the workpackage brief
+					M.on_journal(msg) -- tandem_journal tool — curate the workpackage brief
 				elseif msg.type == "backlog" then
-					M.on_backlog(msg) -- loupe_backlog tool — add/complete tasks
+					M.on_backlog(msg) -- tandem_backlog tool — add/complete tasks
 				elseif msg.type == "permission" then
 					M.on_permission(msg) -- a side-effecting tool wants to run — ask first
 				elseif msg.type == "status" then
@@ -1123,7 +1138,7 @@ local function ensure_daemon()
 			daemon.ready = false
 			if next(daemon.handlers) ~= nil then -- died mid-request
 				vim.schedule(function()
-					M.toast("⚠ Loupe daemon stopped (exit " .. tostring(code) .. ")", { title = " loupe ", timeout = 8000 })
+					M.toast("⚠ Tandem daemon stopped (exit " .. tostring(code) .. ")", { title = " tandem ", timeout = 8000 })
 				end)
 			end
 			daemon.handlers = {}
@@ -1137,7 +1152,7 @@ function M.restart_daemon()
 		vim.fn.jobstop(daemon.job)
 	end
 	daemon.job, daemon.ready, daemon.queue = nil, false, {}
-	vim.notify("Loupe: daemon restarted")
+	vim.notify("Tandem: daemon restarted")
 end
 
 local function send_cmd(cmd)
@@ -1168,7 +1183,7 @@ function M.confirm_write()
 	if fn then
 		fn()
 	else
-		vim.notify("Loupe: nothing waiting to write")
+		vim.notify("Tandem: nothing waiting to write")
 	end
 end
 
@@ -1176,7 +1191,7 @@ end
 -- issues several writes/regions in one turn (parallel tool calls), we run them ONE
 -- AT A TIME in arrival order. `M._edit_busy` is claimed by the FIRST edit and held
 -- until the queue fully drains — so an edit arriving in the gap between one finishing
--- and the next starting (the agent fires its next loupe_write the instant it gets
+-- and the next starting (the agent fires its next tandem_write the instant it gets
 -- edit_done) still queues behind, instead of racing ahead. Each queued tool stays
 -- blocked (no edit_done) until its turn, so the agent's ordering is preserved.
 M._edit_queue = M._edit_queue or {}
@@ -1229,8 +1244,8 @@ end
 
 -- ── Pending regions (FIFO) ──────────────────────────────────────
 -- Each "select a region + ask" arms a region (its own marks in region_ns). Several
--- can be armed at once; they're consumed in ORDER by loupe_region calls (turns run
--- sequentially, so the Nth loupe_region belongs to the Nth armed region). An entry is
+-- can be armed at once; they're consumed in ORDER by tandem_region calls (turns run
+-- sequentially, so the Nth tandem_region belongs to the Nth armed region). An entry is
 -- { buf, top, bot, kind, ns }.
 M._region_queue = M._region_queue or {}
 
@@ -1279,7 +1294,7 @@ function M._drain_region_queue()
 	end
 end
 
--- The agent's loupe_write tool (via the daemon bridge) wants to write a file. We
+-- The agent's tandem_write tool (via the daemon bridge) wants to write a file. We
 -- own application: type the content into the buffer with the watchable typewriter,
 -- persist it, then ack so the blocked tool returns and the agent continues.
 -- We do NOT steal focus (Follow-off behaviour) — <leader>lg jumps you to it.
@@ -1295,7 +1310,7 @@ end
 -- gate, or when dequeued). Never call this directly — go through M.on_edit.
 function M._do_edit(msg)
 	-- Safety net: if a region is armed (you selected/marked a spot), the Driver should
-	-- have used loupe_region. If it used loupe_write instead, still apply to the armed
+	-- have used tandem_region. If it used tandem_write instead, still apply to the armed
 	-- REGION — never blow away the whole file. (Call the body directly: we own the slot.)
 	if M.region_pending() then
 		return M._do_region({ id = msg.id, content = msg.content })
@@ -1328,7 +1343,7 @@ function M._do_edit(msg)
 	end
 
 	-- DIFF-BASED application: type only the changed span, leaving untouched code
-	-- alone. (loupe_write sends the whole file; we diff it against the buffer and
+	-- alone. (tandem_write sends the whole file; we diff it against the buffer and
 	-- find the minimal contiguous range that changed.)
 	local incoming = msg.content or ""
 	local new_lines = vim.split(incoming, "\n", { plain = true })
@@ -1389,10 +1404,10 @@ function M._do_edit(msg)
 	end)
 end
 
--- The agent's loupe_region tool: replace ONLY a marked region (a selection the user
+-- The agent's tandem_region tool: replace ONLY a marked region (a selection the user
 -- pointed at) with the returned snippet — typed in via the mark-anchored typewriter,
 -- so you can keep editing outside it. Regions are consumed FIFO from M._region_queue:
--- the Nth loupe_region call fills the Nth region you armed.
+-- the Nth tandem_region call fills the Nth region you armed.
 function M.on_region(msg)
 	-- Serialize behind any edit already in flight (see M._edit_queue).
 	if defer_if_busy("region", msg) then
@@ -1461,7 +1476,7 @@ function M._do_region(msg)
 	end)
 end
 
--- The agent's loupe_ask tool: it needs a decision and is BLOCKED until you answer.
+-- The agent's tandem_ask tool: it needs a decision and is BLOCKED until you answer.
 -- We show the question and open an input; your answer (or a dismissal) is sent back
 -- as the tool result so the agent continues.
 function M.on_ask(msg)
@@ -1476,7 +1491,7 @@ function M.on_ask(msg)
 		L = math.max(0, math.floor((vim.o.columns - W) / 2)),
 		Wt = W, Ht = H, input_h = 4, no_rail = true,
 	}
-	local P = make_panel(box, "loupe asks · Enter = discuss · ^S = send answer")
+	local P = make_panel(box, "tandem asks · Enter = discuss · ^S = send answer")
 	P.append(vim.split(question, "\n", { plain = true }))
 	P.append({ "" })
 
@@ -1496,7 +1511,7 @@ function M.on_ask(msg)
 
 	local discuss_system = 'You previously asked the user this question and they want to discuss it before deciding: "'
 		.. question
-		.. '". Talk it through — clarify what you meant, lay out options and trade-offs. Reply in plain text ONLY; do NOT call loupe_write, loupe_region, loupe_ask, loupe_instruct or any edit tool.'
+		.. '". Talk it through — clarify what you meant, lay out options and trade-offs. Reply in plain text ONLY; do NOT call tandem_write, tandem_region, tandem_ask, tandem_instruct or any edit tool.'
 
 	-- Enter: discuss with a FORK of the working session (it inherits the context).
 	vim.fn.prompt_setcallback(P.input_buf, function(input)
@@ -1541,7 +1556,7 @@ function M.on_ask(msg)
 	P.focus_input()
 end
 
--- The agent's loupe_notify tool: a transient status line (non-blocking).
+-- The agent's tandem_notify tool: a transient status line (non-blocking).
 function M.on_notify(msg)
 	if msg.message and msg.message ~= "" then
 		M.toast(msg.message)
@@ -1550,7 +1565,7 @@ end
 
 -- A side-effecting tool (bash, webfetch, …) wants to run. Ask before it does —
 -- allow once / allow always (this daemon run) / reject. Dismissing rejects (safe
--- default: never run a command you didn't approve). Reads/greps + Loupe's own tools
+-- default: never run a command you didn't approve). Reads/greps + Tandem's own tools
 -- are auto-allowed by the daemon and never reach here.
 function M.on_permission(msg)
 	local tool = msg.tool or "a tool"
@@ -1558,7 +1573,7 @@ function M.on_permission(msg)
 	vim.schedule(function()
 		local label = (command ~= "" and command ~= tool) and (tool .. " · " .. command) or tool
 		vim.ui.select({ "Allow once", "Allow always (this session)", "Reject" }, {
-			prompt = "Loupe — run  " .. label .. "  ?",
+			prompt = "Tandem — run  " .. label .. "  ?",
 		}, function(choice)
 			local decision = "reject"
 			if choice == "Allow once" then
@@ -1571,7 +1586,7 @@ function M.on_permission(msg)
 	end)
 end
 
--- The Navigator's loupe_instruct tool: a directive (next step for you). Opens a
+-- The Navigator's tandem_instruct tool: a directive (next step for you). Opens a
 -- formatted (markdown) side-chat seeded with the instruction so you can SEE it nicely
 -- and DISCUSS it (via a fork) before doing it — like the question flow, but since it's
 -- non-blocking there's no answer to send: just q when you're ready to go do the work.
@@ -1591,7 +1606,7 @@ function M.on_instruct(msg)
 		L = math.max(0, math.floor((vim.o.columns - W) / 2)),
 		Wt = W, Ht = H, input_h = 4, no_rail = true,
 	}
-	local P = make_panel(box, "loupe · instruction · Enter = discuss · q = done")
+	local P = make_panel(box, "tandem · instruction · Enter = discuss · q = done")
 	P.append(vim.split("▸ " .. instr, "\n", { plain = true }))
 	P.append({ "" })
 
@@ -1628,14 +1643,14 @@ function M.on_instruct(msg)
 end
 
 -- PAUSE the AI mid-write so you can take the floor. Freezes the typewriter and ENDS
--- the agent's turn (releases the blocked loupe_write tool) so the agent is free to
+-- the agent's turn (releases the blocked tandem_write tool) so the agent is free to
 -- talk. Your half-written file stays as-is. Now open a bubble / the main chat and
 -- have a real back-and-forth — same session, so it's all remembered. When you're
 -- happy, M.continue_work() tells it to carry on with everything that just happened.
 function M.interrupt_edit()
 	local e = M._edit
 	if not e or not vim.api.nvim_buf_is_valid(e.buf) then
-		vim.notify("Loupe: nothing is being written to pause")
+		vim.notify("Tandem: nothing is being written to pause")
 		return
 	end
 	M.pause() -- freeze the typewriter
@@ -1654,14 +1669,14 @@ function M.interrupt_edit()
 		if tr then
 			pcall(vim.api.nvim_buf_set_extmark, e.buf, edit_ns, tr, tc, {
 				id = ae.top, right_gravity = false, virt_lines_above = true,
-				virt_lines = { { { "⟨ paused — <leader>lc to continue ⟩", "LoupeImplementing" } } },
+				virt_lines = { { { "⟨ paused — <leader>lc to continue ⟩", "TandemImplementing" } } },
 			})
 		end
 		local br, bc = mark_pos(e.buf, ae.bot)
 		if br then
 			pcall(vim.api.nvim_buf_set_extmark, e.buf, edit_ns, br, bc, {
 				id = ae.bot, right_gravity = true,
-				virt_lines = { { { "⟨ paused ⟩", "LoupeImplementing" } } },
+				virt_lines = { { { "⟨ paused ⟩", "TandemImplementing" } } },
 			})
 		end
 	end
@@ -1675,7 +1690,7 @@ function M.interrupt_edit()
 	send_cmd({
 		cmd = "edit_done",
 		id = e.id,
-		message = "The user pressed PAUSE to take over for a moment. Stop writing — do NOT call loupe_write again now. Reply with one short sentence acknowledging, then wait for their next message.",
+		message = "The user pressed PAUSE to take over for a moment. Stop writing — do NOT call tandem_write again now. Reply with one short sentence acknowledging, then wait for their next message.",
 	})
 	M.toast("⏸ paused — chat / edit freely; <leader>lc when you want it to continue", { sticky = true })
 end
@@ -1685,7 +1700,7 @@ end
 -- held region's marks, the region's ACTUAL current text so it resumes from your reality.
 function M.continue_work()
 	if not M.active_session then
-		vim.notify("Loupe: no session to continue")
+		vim.notify("Tandem: no session to continue")
 		return
 	end
 	local held = M._held
@@ -1701,7 +1716,7 @@ function M.continue_work()
 			local cur = table.concat(vim.api.nvim_buf_get_text(held.buf, tr, tc, br, bc, {}), "\n")
 			extra = "\n\nThe marked region currently contains this (including any edits I made):\n"
 				.. cur
-				.. "\n\nReturn the COMPLETE finished code for THIS region via loupe_region — it replaces only the marked region; do NOT rewrite the rest of the file."
+				.. "\n\nReturn the COMPLETE finished code for THIS region via tandem_region — it replaces only the marked region; do NOT rewrite the rest of the file."
 			-- keep the held marks and scope the continuation to them, so it re-types
 			-- only the region (not the whole file). The held marks live in edit_ns.
 			armed = M.region_arm({ buf = held.buf, top = held.top, bot = held.bot, kind = "replace", ns = edit_ns })
@@ -1742,7 +1757,7 @@ function M.cancel(session)
 	end
 end
 
--- Global cancel: stop EVERYTHING Loupe is doing — abort all running turns, stop the
+-- Global cancel: stop EVERYTHING Tandem is doing — abort all running turns, stop the
 -- typewriter mid-type, and clear the spinner / toasts / pending question.
 function M.cancel_all()
 	M.pause() -- stop any in-progress typing
@@ -1754,7 +1769,7 @@ function M.cancel_all()
 	M.activity_reset()
 	M.toast_dismiss()
 	M.pending_question = nil
-	vim.notify("Loupe: cancelled")
+	vim.notify("Tandem: cancelled")
 end
 
 -- Stream a prompt. `session` is nil (new) or a "ses_…" id (continue).
@@ -1770,7 +1785,7 @@ function M.prompt(session, text, on_event, fork, opts)
 		on_event(msg)
 		if msg.type == "error" then
 			M.toast("⚠ " .. (type(msg.error) == "string" and msg.error or vim.inspect(msg.error)), {
-				title = " loupe error ",
+				title = " tandem error ",
 				timeout = 8000,
 			})
 		end
@@ -1789,8 +1804,8 @@ function M.prompt(session, text, on_event, fork, opts)
 		model = M.active_model and { providerID = M.active_model.providerID, modelID = M.active_model.modelID } or nil,
 		system = opts.system or M.build_system(), -- per-role behaviour from the agent files
 		agent = opts.agent or (({ navigator = "plan", neutral = "build", driver = "build" })[M.role] or "build"),
-		-- Driver writes ONLY through loupe_write (watchable typewriter) — disable the
-		-- native writers so it can't bypass Loupe and clobber files on disk.
+		-- Driver writes ONLY through tandem_write (watchable typewriter) — disable the
+		-- native writers so it can't bypass Tandem and clobber files on disk.
 		tools = opts.tools ~= nil and opts.tools
 			or ((M.role == "driver") and { write = false, edit = false, patch = false } or nil),
 	})
@@ -1885,7 +1900,7 @@ end
 --   packages = { ["<name>"] = { sessions = { {key,name,id,backend}, … } }, … },
 -- }
 local function wp_root()
-	return vim.fn.getcwd() .. "/.loupe/wp"
+	return vim.fn.getcwd() .. "/.tandem/wp"
 end
 local function wp_dir(name)
 	return wp_root() .. "/" .. name
@@ -2062,7 +2077,7 @@ function M.new_session(name)
 		M.render_transcript(M._main, nil)
 	end
 	M.rail_refresh()
-	vim.notify("Loupe: new session '" .. name .. "' in " .. m.active.wp)
+	vim.notify("Tandem: new session '" .. name .. "' in " .. m.active.wp)
 end
 
 -- Create a NEW workpackage — born with its first session — and switch to it.
@@ -2073,7 +2088,7 @@ function M.wp_create(name)
 	end
 	local m = wp_manifest()
 	if m.packages[name] then
-		vim.notify("Loupe: workpackage '" .. name .. "' already exists")
+		vim.notify("Tandem: workpackage '" .. name .. "' already exists")
 		return
 	end
 	local key = new_key()
@@ -2085,7 +2100,7 @@ function M.wp_create(name)
 	M.active_session = nil
 	M._usage = nil
 	M.rail_refresh()
-	vim.notify("Loupe workpackage → " .. name)
+	vim.notify("Tandem workpackage → " .. name)
 end
 
 -- Prompt for a name, then create a workpackage.
@@ -2122,7 +2137,7 @@ function M.activate_session(wp, key)
 		M.fetch_usage(M.active_session)
 	end
 	M.rail_refresh()
-	vim.notify("Loupe → " .. wp .. " ▸ " .. target.name)
+	vim.notify("Tandem → " .. wp .. " ▸ " .. target.name)
 end
 
 -- Switch sessions via a hierarchy: every workpackage's sessions listed as
@@ -2220,7 +2235,7 @@ function M.wp_rename()
 		end
 		local m = wp_manifest()
 		if m.packages[new] then
-			vim.notify("Loupe: workpackage '" .. new .. "' already exists")
+			vim.notify("Tandem: workpackage '" .. new .. "' already exists")
 			return
 		end
 		m.packages[new] = m.packages[old]
@@ -2295,7 +2310,7 @@ function M.ensure_journal(name)
 	end
 end
 
--- The agent's loupe_journal tool: REPLACE the workpackage journal with a freshly
+-- The agent's tandem_journal tool: REPLACE the workpackage journal with a freshly
 -- curated brief (the AI keeps it concise — goal / state / decisions / approach).
 function M.on_journal(msg)
 	local content = msg.content or ""
@@ -2306,7 +2321,7 @@ function M.on_journal(msg)
 	M.toast("✎ journal updated — <leader>lj to view")
 end
 
--- Mark backlog items done by matching their text (used by loupe_backlog complete).
+-- Mark backlog items done by matching their text (used by tandem_backlog complete).
 function M.backlog_complete(texts)
 	local path = M.wp_backlog_path()
 	if vim.fn.filereadable(path) == 0 then
@@ -2327,7 +2342,7 @@ function M.backlog_complete(texts)
 	M.rail_refresh()
 end
 
--- The agent's loupe_backlog tool: add new tasks and/or tick off finished ones. We
+-- The agent's tandem_backlog tool: add new tasks and/or tick off finished ones. We
 -- never rewrite the whole list (so your ordering + manual edits are preserved).
 function M.on_backlog(msg)
 	if msg.add then
@@ -2359,7 +2374,7 @@ function M.view_journal()
 		title_pos = "center",
 	})
 	vim.wo[win].wrap, vim.wo[win].linebreak, vim.wo[win].conceallevel = true, true, 2
-	vim.wo[win].winhighlight = "FloatBorder:LoupeBorderActive"
+	vim.wo[win].winhighlight = "FloatBorder:TandemBorderActive"
 	vim.keymap.set("n", "q", function()
 		pcall(function() vim.cmd("silent keepalt noautocmd write") end)
 		pcall(vim.api.nvim_win_close, win, true)
@@ -2371,13 +2386,13 @@ end
 -- ambiently per the agent files, but you can always force it).
 function M.capture_plan()
 	if not M.active_session then
-		vim.notify("Loupe: no active session to capture from")
+		vim.notify("Tandem: no active session to capture from")
 		return
 	end
 	M.toast("✎ capturing our plan into the journal + backlog…")
 	M.run(
 		M.active_session,
-		"Based on our conversation so far, curate this workpackage's shared memory: call loupe_journal with a concise, up-to-date brief (goal, current state, key decisions, approach & constraints), and call loupe_backlog to add any concrete tasks we've identified. Keep the journal tight — it's injected into every session."
+		"Based on our conversation so far, curate this workpackage's shared memory: call tandem_journal with a concise, up-to-date brief (goal, current state, key decisions, approach & constraints), and call tandem_backlog to add any concrete tasks we've identified. Keep the journal tight — it's injected into every session."
 	)
 end
 
@@ -2479,7 +2494,7 @@ function M.backlog()
 		title_pos = "center",
 	})
 	vim.wo[win].wrap, vim.wo[win].linebreak, vim.wo[win].conceallevel = true, true, 2
-	vim.wo[win].winhighlight = "FloatBorder:LoupeBorderActive"
+	vim.wo[win].winhighlight = "FloatBorder:TandemBorderActive"
 	vim.keymap.set("n", "<CR>", function()
 		local l = vim.api.nvim_get_current_line()
 		if l:match("^%s*%- %[ %]") then
@@ -2514,7 +2529,7 @@ function M.plan()
 			.. "\n\nBreak this into a PRIORITIZED backlog of concrete, actionable tasks (highest priority "
 			.. "first). Reply with ONLY a markdown checklist — one task per line:\n- [ ] first task\n- [ ] second task"
 		local acc = ""
-		vim.notify("Loupe: planning the backlog…")
+		vim.notify("Tandem: planning the backlog…")
 		M.prompt(nil, prompt, function(msg)
 			if msg.type == "delta" then
 				acc = acc .. msg.text
@@ -2527,13 +2542,13 @@ function M.plan()
 					end
 				end
 				if #tasks == 0 then
-					vim.notify("Loupe: couldn't parse a backlog from the reply")
+					vim.notify("Tandem: couldn't parse a backlog from the reply")
 					return
 				end
 				for _, t in ipairs(tasks) do
 					M.backlog_add(t)
 				end
-				vim.notify("Loupe: added " .. #tasks .. " tasks to the backlog")
+				vim.notify("Tandem: added " .. #tasks .. " tasks to the backlog")
 				M.backlog()
 			end
 		end, false, { agent = "plan", tools = { write = false, edit = false, patch = false } })
@@ -2579,7 +2594,7 @@ function M.toast(text, opts)
 		style = "minimal",
 		border = "rounded",
 		focusable = false,
-		title = opts.title or " loupe ",
+		title = opts.title or " tandem ",
 		title_pos = "center",
 		noautocmd = true,
 	})
@@ -2600,7 +2615,7 @@ local activity = { n = 0, win = nil, timer = nil, frame = 1, label = nil }
 local SPINNER = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
 
 local function activity_render()
-	local text = SPINNER[activity.frame] .. " " .. (activity.label or "loupe working…")
+	local text = SPINNER[activity.frame] .. " " .. (activity.label or "tandem working…")
 	local width = math.min(vim.fn.strdisplaywidth(text), vim.o.columns - 2)
 	if activity.win and vim.api.nvim_win_is_valid(activity.win) then
 		vim.api.nvim_buf_set_lines(vim.api.nvim_win_get_buf(activity.win), 0, -1, false, { text })
@@ -2689,10 +2704,10 @@ end
 -- Questions/instructions are sticky; narration auto-dismisses. Every tag also
 -- lands in the rail's TO-DO panel so it persists after the toast fades.
 function M.handle_tags(acc, session)
-	local q = acc:match("<loupe:ask>(.-)</loupe:ask>")
-	local instr = acc:match("<loupe:instruction>(.-)</loupe:instruction>")
+	local q = acc:match("<tandem:ask>(.-)</tandem:ask>")
+	local instr = acc:match("<tandem:instruction>(.-)</tandem:instruction>")
 	local notes = {}
-	for note in acc:gmatch("<loupe:notify>(.-)</loupe:notify>") do
+	for note in acc:gmatch("<tandem:notify>(.-)</tandem:notify>") do
 		notes[#notes + 1] = vim.trim(note)
 	end
 
@@ -2712,7 +2727,7 @@ function M.handle_tags(acc, session)
 
 	if q then
 		M.pending_question = { question = vim.trim(q), session = session }
-		M.toast("❓ " .. vim.trim(q) .. "\n\n<leader>lq to answer", { sticky = true, title = " loupe asks " })
+		M.toast("❓ " .. vim.trim(q) .. "\n\n<leader>lq to answer", { sticky = true, title = " tandem asks " })
 	elseif instr then
 		M.last_instruction = vim.trim(instr)
 		M.toast("▸ " .. vim.trim(instr) .. "\n\n<leader>lx to dismiss", { sticky = true, title = " instruction " })
@@ -2732,7 +2747,7 @@ function M.run(session, text)
 		elseif msg.type == "delta" then
 			acc = acc .. msg.text
 		elseif msg.type == "done" then
-			-- Driver edits now arrive via the loupe_write tool (→ M.on_edit), so there's
+			-- Driver edits now arrive via the tandem_write tool (→ M.on_edit), so there's
 			-- no suggestion to apply here; just surface notify/ask/instruction.
 			M.handle_tags(acc, session)
 		end
@@ -2743,7 +2758,7 @@ end
 function M.answer()
 	local pq = M.pending_question
 	if not pq then
-		vim.notify("Loupe: no pending question")
+		vim.notify("Tandem: no pending question")
 		return
 	end
 	vim.ui.input({ prompt = pq.question .. " " }, function(ans)
@@ -2765,7 +2780,7 @@ function M.answer()
 end
 
 -- ── Pairing modes (role / level / coach) ────────────────────────
-local AGENTS = vim.fn.expand("~/Projects/loupe/agents/")
+local AGENTS = PLUGIN_ROOT .. "/agents/"
 
 local function read_file(path)
 	if vim.fn.filereadable(path) == 0 then
@@ -2781,14 +2796,14 @@ M.follow = false -- when ON, jump to & watch the AI's edits live (else type off-
 
 local LEVEL_TEXT = {
 	navigator = {
-		high = "Guidance level: HIGH — keep every direction (loupe_instruct) very high-level and conceptual: name the goal or the approach, not the steps. e.g. 'add input validation to the form'. Let the human work out the how.",
+		high = "Guidance level: HIGH — keep every direction (tandem_instruct) very high-level and conceptual: name the goal or the approach, not the steps. e.g. 'add input validation to the form'. Let the human work out the how.",
 		medium = "Guidance level: MEDIUM — give the key steps but not every detail: outline the moving parts. e.g. 'validate each field, then show errors next to the inputs'.",
 		low = "Guidance level: LOW — be granular and exact in each direction: tell them precisely what to do, step by step, down to specific names, signatures, and lines. e.g. 'in utils.lua add a function reverse(list) that loops from #list down to 1'.",
 	},
 	driver = {
-		high = "Autonomy: HIGH — work autonomously. Minimal chatter: at most one loupe_notify at the end. Rarely use loupe_ask.",
-		medium = "Autonomy: MEDIUM — a short loupe_notify at each significant step; use loupe_ask only for genuine decisions.",
-		low = "Autonomy: LOW — narrate each significant change with loupe_notify, and use loupe_ask before ANY naming or structural choice (function/variable/file names, how to structure something) — stop and wait for the answer.",
+		high = "Autonomy: HIGH — work autonomously. Minimal chatter: at most one tandem_notify at the end. Rarely use tandem_ask.",
+		medium = "Autonomy: MEDIUM — a short tandem_notify at each significant step; use tandem_ask only for genuine decisions.",
+		low = "Autonomy: LOW — narrate each significant change with tandem_notify, and use tandem_ask before ANY naming or structural choice (function/variable/file names, how to structure something) — stop and wait for the answer.",
 	},
 }
 
@@ -2806,10 +2821,10 @@ function M.build_system()
 end
 
 function M.pick_role()
-	vim.ui.select({ "neutral", "navigator", "driver" }, { prompt = "Loupe role:" }, function(r)
+	vim.ui.select({ "neutral", "navigator", "driver" }, { prompt = "Tandem role:" }, function(r)
 		if r then
 			M.role = r
-			vim.notify("Loupe role → " .. r)
+			vim.notify("Tandem role → " .. r)
 			M.rail_refresh()
 		end
 	end)
@@ -2818,7 +2833,7 @@ end
 function M.pick_level()
 	-- Level's MEANING depends on the mode: navigator = guidance grain, driver = autonomy.
 	if not LEVEL_TEXT[M.role] then
-		vim.notify("Loupe: '" .. M.role .. "' mode has no level — pick navigator or driver")
+		vim.notify("Tandem: '" .. M.role .. "' mode has no level — pick navigator or driver")
 		return
 	end
 	vim.ui.select({ "high", "medium", "low" }, {
@@ -2826,7 +2841,7 @@ function M.pick_level()
 	}, function(l)
 		if l then
 			M.level = l
-			vim.notify("Loupe level → " .. l)
+			vim.notify("Tandem level → " .. l)
 			M.rail_refresh()
 		end
 	end)
@@ -2834,7 +2849,7 @@ end
 
 function M.toggle_coach()
 	M.coach = not M.coach
-	vim.notify("Loupe coach → " .. (M.coach and "on" or "off"))
+	vim.notify("Tandem coach → " .. (M.coach and "on" or "off"))
 	M.rail_refresh()
 end
 
@@ -2843,14 +2858,14 @@ end
 -- off-screen and a toast offers <leader>lg to follow manually.
 function M.toggle_follow()
 	M.follow = not M.follow
-	vim.notify("Loupe follow → " .. (M.follow and "on" or "off"))
+	vim.notify("Tandem follow → " .. (M.follow and "on" or "off"))
 	M.rail_refresh()
 end
 
 -- Pick the role, then (for navigator/driver) immediately CASCADE into its level.
 -- This is the "choose the mode and you're made to set the sub-setting too" flow.
 function M.pick_mode()
-	vim.ui.select({ "neutral", "navigator", "driver" }, { prompt = "Loupe mode:" }, function(r)
+	vim.ui.select({ "neutral", "navigator", "driver" }, { prompt = "Tandem mode:" }, function(r)
 		if not r then
 			return
 		end
@@ -2861,11 +2876,11 @@ function M.pick_mode()
 				if l then
 					M.level = l
 				end
-				vim.notify("Loupe → " .. r .. (l and (" / " .. l) or ""))
+				vim.notify("Tandem → " .. r .. (l and (" / " .. l) or ""))
 				M.rail_refresh()
 			end)
 		else
-			vim.notify("Loupe → " .. r)
+			vim.notify("Tandem → " .. r)
 			M.rail_refresh()
 		end
 	end)
@@ -2893,7 +2908,7 @@ function M.settings_menu()
 		{ label = "Plan backlog (AI)", run = M.plan },
 	}
 	vim.ui.select(items, {
-		prompt = "Loupe settings:",
+		prompt = "Tandem settings:",
 		format_item = function(it)
 			return it.label
 		end,
@@ -2907,7 +2922,7 @@ end
 -- Ask the Navigator for the next instruction; it surfaces as a sticky toast.
 function M.next_instruction()
 	if not M.active_session then
-		vim.notify("Loupe: no active session")
+		vim.notify("Tandem: no active session")
 		return
 	end
 	M.run(M.active_session, "What is the next instruction? Keep it to one step.")
@@ -3031,10 +3046,10 @@ function M.render_transcript(P, session)
 		end
 		for _, m in ipairs(messages) do
 			local txt = vim.trim((m.text or "")
-				:gsub("<loupe:suggest[^>]*>(.-)</loupe:suggest>", "%1")
-				:gsub("<loupe:notify>.-</loupe:notify>", "")
-				:gsub("<loupe:ask>.-</loupe:ask>", "")
-				:gsub("<loupe:instruction>.-</loupe:instruction>", ""))
+				:gsub("<tandem:suggest[^>]*>(.-)</tandem:suggest>", "%1")
+				:gsub("<tandem:notify>.-</tandem:notify>", "")
+				:gsub("<tandem:ask>.-</tandem:ask>", "")
+				:gsub("<tandem:instruction>.-</tandem:instruction>", ""))
 			if txt ~= "" then
 				if m.role == "user" then
 					P.append_user(txt)
@@ -3049,7 +3064,7 @@ function M.render_transcript(P, session)
 end
 
 function M.open_chat()
-	local P = make_panel(centre_box(), "loupe · conversation")
+	local P = make_panel(centre_box(), "tandem · conversation")
 	M._main = P -- the command centre; session switches re-render its transcript
 
 	vim.fn.prompt_setcallback(P.input_buf, function(input)
@@ -3231,7 +3246,7 @@ function M.review_show_summary()
 		focusable = false, noautocmd = true,
 	})
 	vim.wo[review_box].wrap = true
-	vim.wo[review_box].winhighlight = "FloatBorder:LoupeBorderActive"
+	vim.wo[review_box].winhighlight = "FloatBorder:TandemBorderActive"
 	review_last = h.hash
 end
 
@@ -3239,12 +3254,12 @@ end
 function M.review()
 	local root = cwd_git_root()
 	if not root then
-		vim.notify("Loupe review: needs a git repo")
+		vim.notify("Tandem review: needs a git repo")
 		return
 	end
 	local hunks = git_hunks(root)
 	if #hunks == 0 then
-		vim.notify("Loupe review: no uncommitted changes")
+		vim.notify("Tandem review: no uncommitted changes")
 		return
 	end
 	M._review_hunks = hunks
@@ -3252,11 +3267,11 @@ function M.review()
 	for _, h in ipairs(hunks) do
 		items[#items + 1] = { filename = h.file, lnum = h.lnum, text = qf_text(h) }
 	end
-	vim.fn.setqflist({}, "r", { title = "Loupe review", items = items })
+	vim.fn.setqflist({}, "r", { title = "Tandem review", items = items })
 	vim.cmd("copen")
 	pcall(vim.cmd, "cfirst")
 	M._review_active = true
-	local grp = vim.api.nvim_create_augroup("LoupeReview", { clear = true })
+	local grp = vim.api.nvim_create_augroup("TandemReview", { clear = true })
 	vim.api.nvim_create_autocmd("CursorMoved", {
 		group = grp,
 		callback = function()
@@ -3265,7 +3280,7 @@ function M.review()
 			end
 		end,
 	})
-	vim.notify(string.format("Loupe review: %d change%s — :cnext/:cprev to walk", #hunks, #hunks > 1 and "s" or ""))
+	vim.notify(string.format("Tandem review: %d change%s — :cnext/:cprev to walk", #hunks, #hunks > 1 and "s" or ""))
 	M.review_show_summary()
 end
 
@@ -3274,7 +3289,7 @@ end
 function M.review_summaries()
 	local hunks = M._review_hunks
 	if not hunks or #hunks == 0 then
-		vim.notify("Loupe review: run review first")
+		vim.notify("Tandem review: run review first")
 		return
 	end
 	local parts = {
@@ -3293,7 +3308,7 @@ function M.review_summaries()
 		parts[#parts + 1] = "<<HUNK " .. i .. ">> (" .. h.label .. ")\n" .. h.diff .. "\n"
 	end
 	local acc = ""
-	vim.notify("Loupe review: generating summaries…")
+	vim.notify("Tandem review: generating summaries…")
 	M.prompt(nil, table.concat(parts, "\n"), function(msg)
 		if msg.type == "delta" then
 			acc = acc .. msg.text
@@ -3317,11 +3332,11 @@ function M.review_summaries()
 				for _, h in ipairs(hunks) do
 					items[#items + 1] = { filename = h.file, lnum = h.lnum, text = qf_text(h) }
 				end
-				vim.fn.setqflist({}, "r", { title = "Loupe review", items = items })
+				vim.fn.setqflist({}, "r", { title = "Tandem review", items = items })
 			end
 			review_last = nil
 			M.review_show_summary()
-			vim.notify("Loupe review: summaries ready")
+			vim.notify("Tandem review: summaries ready")
 		end
 	end, false, {
 		system = "You explain code changes concisely and accurately, grounded ONLY in the diff shown. Do not use tools or write files.",
@@ -3334,13 +3349,13 @@ function M.review_exit()
 	M._review_active = false
 	M._review_hunks = nil
 	review_box_close()
-	pcall(vim.api.nvim_del_augroup_by_name, "LoupeReview")
+	pcall(vim.api.nvim_del_augroup_by_name, "TandemReview")
 	pcall(vim.cmd, "cclose")
-	vim.notify("Loupe review: exited")
+	vim.notify("Tandem review: exited")
 end
 
 -- ── Surface focus / visibility ──────────────────────────────────
--- Cycle focus around a ring of [ your code window, each open Loupe input surface ].
+-- Cycle focus around a ring of [ your code window, each open Tandem input surface ].
 -- So one key lets you leave an input (it stays open), pop to your buffer to make the
 -- change, and come back — and reach any of several stacked bubbles.
 function M.toggle_focus()
@@ -3351,13 +3366,13 @@ function M.toggle_focus()
 			break
 		end
 	end
-	for _, w in ipairs(vim.api.nvim_list_wins()) do -- then each Loupe input surface
+	for _, w in ipairs(vim.api.nvim_list_wins()) do -- then each Tandem input surface
 		if is_surface(w) and vim.bo[vim.api.nvim_win_get_buf(w)].buftype == "prompt" then
 			ring[#ring + 1] = w
 		end
 	end
 	if #ring < 2 then
-		vim.notify("Loupe: nothing to switch to")
+		vim.notify("Tandem: nothing to switch to")
 		return
 	end
 	local cur = vim.api.nvim_get_current_win()
@@ -3376,7 +3391,7 @@ function M.toggle_focus()
 	end
 end
 
--- Close all open Loupe surfaces at once (clear the screen).
+-- Close all open Tandem surfaces at once (clear the screen).
 function M.close_surfaces()
 	for _, w in ipairs(vim.api.nvim_list_wins()) do
 		if is_surface(w) and vim.api.nvim_win_is_valid(w) then
@@ -3387,7 +3402,7 @@ function M.close_surfaces()
 end
 
 function M.hello()
-	vim.notify("Loupe is loaded")
+	vim.notify("Tandem is loaded")
 end
 
 return M

@@ -1,6 +1,6 @@
-# Loupe — Design Document
+# Tandem — Design Document
 
-> Working title. A *loupe* is the small magnifier used to examine fine detail up
+> Working title. A *tandem* is the small magnifier used to examine fine detail up
 > close. Rename freely.
 
 Status: **brainstorm / pre-implementation**. This doc is the durable reference so
@@ -19,7 +19,7 @@ The user is a capable engineer who (a) is losing hands-on skill by architecting
 instead of building, (b) can't retain decisions made passively in long agent
 chats, and (c) procrastinates because their brain demands full understanding
 before starting. Existing tools (Claude Code, OpenCode) optimize for *throughput*
-— the human approves at the end. Loupe optimizes for the human staying **in the
+— the human approves at the end. Tandem optimizes for the human staying **in the
 loop, in the editor, learning as they go**, while still getting a real speed-up.
 
 ### Design tenets
@@ -104,7 +104,7 @@ they trigger.
 ### 3.3 The gate is a conversation, not a form
 
 Anti-pattern (what Claude Code / OpenCode / batch question UIs do): generate
-everything, then dump a pile of questions to answer-and-submit. Loupe instead
+everything, then dump a pile of questions to answer-and-submit. Tandem instead
 opens a **tiny scoped chat in the bubble** at each breakpoint: one question, fully
 interactive. "I don't get it" → it elaborates *right there* → back-and-forth until
 you give a real answer → it continues to the next breakpoint. The difference is
@@ -112,7 +112,7 @@ you give a real answer → it continues to the next breakpoint. The difference i
 
 ### 3.4 The pairing model (the USP — canonical; supersedes the old Coach/Pair/Pilot/Auto dial)
 
-Loupe is built on pair-programming idioms. The AI takes a **role**, set by injecting
+Tandem is built on pair-programming idioms. The AI takes a **role**, set by injecting
 a per-mode **agent/skill markdown** that forces both behaviour and output structure
 (tags). Change it live, anytime.
 
@@ -128,8 +128,8 @@ a per-mode **agent/skill markdown** that forces both behaviour and output struct
   me, help me get there myself.
 
 **Engine split by Driver autonomy (confirmed):**
-- **Low/Medium Driver** = the model *proposes* tagged edits and **Loupe types them
-  in** via the typewriter — watchable, pace-controlled, pausable, gated. Loupe owns
+- **Low/Medium Driver** = the model *proposes* tagged edits and **Tandem types them
+  in** via the typewriter — watchable, pace-controlled, pausable, gated. Tandem owns
   the write. (Same machinery as Navigator; only the *rendering* differs — Navigator
   → ghost, Driver → committed.)
 - **High Driver** = OpenCode's `build` agent runs the real agentic loop and **writes
@@ -137,7 +137,7 @@ a per-mode **agent/skill markdown** that forces both behaviour and output struct
   the write.
 
 **Mechanism:** each Role+Level = an injected agent/skill file + a tag contract;
-Loupe routes the tagged output (ghost vs commit, toast vs popup vs panel). The
+Tandem routes the tagged output (ghost vs commit, toast vs popup vs panel). The
 generalization of §3.13.
 
 ### 3.4.1 The three surfaces
@@ -163,7 +163,7 @@ codebase**, not the chat — the antidote to high-autonomy amnesia, and the
 realization of §3.5. It's just **Navigator mode pointed at a change-set**:
 - Grounded in the *real* diff (OpenCode session diff / `file.edited`) so it can't
   hallucinate the summary.
-- The AI emits tagged recap entries (`<loupe:recap file="…" loc="…" why="…">…`), one
+- The AI emits tagged recap entries (`<tandem:recap file="…" loc="…" why="…">…`), one
   per change → each becomes a **stop**.
 - Layout: right split = recap panel (what / where / why); left = the code;
   **next/prev jumps the cursor to each change**; at each stop a **bubble** asks "why
@@ -264,12 +264,12 @@ with the accumulated history, so the model "remembers." Past the context window,
 *compaction* summarizes older messages (lossy, and invisible to you).
 OpenCode/Claude Code default to one long session per chunk of work.
 
-**The trap:** naively funnelling every Loupe bubble into one ever-growing session
-reintroduces the exact problem Loupe exists to kill — an opaque linear transcript
+**The trap:** naively funnelling every Tandem bubble into one ever-growing session
+reintroduces the exact problem Tandem exists to kill — an opaque linear transcript
 you can't hold in your head, lossy after compaction, tangling real work with
 throwaway questions.
 
-**Loupe's answer — context is *assembled* per question from three sources:**
+**Tandem's answer — context is *assembled* per question from three sources:**
 1. **Located context** — code under cursor / selection / file.
 2. **Session context** — the conversation thread the question belongs to.
 3. **Project context = the journal (§3.6)** — durable plan, decisions, intentions;
@@ -311,15 +311,15 @@ associates with it.
 
 **Forking (OpenCode supports `--fork`):** a fork branches a session at a point; the
 branch inherits all prior context then diverges, leaving the original untouched.
-Loupe's use — side-questions split in two:
+Tandem's use — side-questions split in two:
 1. *Standalone* ("how do I free memory in Zig?") → fresh ephemeral session, no
    context, no pollution.
 2. *Context-needing but non-polluting* ("why did we make this async?") → **fork the
    working session**, ask with full context, main thread stays clean.
 
-**The abstraction thesis (core):** Loupe is an orchestration layer over OpenCode's
+**The abstraction thesis (core):** Tandem is an orchestration layer over OpenCode's
 session/memory primitives. The user operates at the level of *intent* ("start a
-work package", "ask about this", "coach me", "go build this"); Loupe decides in the
+work package", "ask about this", "coach me", "go build this"); Tandem decides in the
 background which session to talk to, whether to fork, and what journal context to
 inject. Raw sessions/compaction/forks are plumbing the user should almost never
 think about. **This abstraction layer is the product; OpenCode is the engine.**
@@ -331,18 +331,18 @@ assignment.
 ### 3.13 Structured output contract & injected agents/skills (keystone)
 
 To the model, its reply is just text — it cannot tell "example" from "prose" from
-"an edit" from "a decision." So Loupe must make the model **tag** its output, then
+"an edit" from "a decision." So Tandem must make the model **tag** its output, then
 parse and route it. **Every routing feature depends on this one mechanism** — the
 three channels (§3.9), decision markers (§3.3), tool handling (§3.11).
 
 Mechanism: inject an OpenCode **agent/skill** (or system preamble) that enforces an
 output contract, e.g.:
 
-    <loupe:suggest target="foo.zig:42"> ...code... </loupe:suggest>
-    <loupe:decision q="env var name?" default="DATABASE_URL"> ...
-    <loupe:edit file="..."> ...code... </loupe:edit>
+    <tandem:suggest target="foo.zig:42"> ...code... </tandem:suggest>
+    <tandem:decision q="env var name?" default="DATABASE_URL"> ...
+    <tandem:edit file="..."> ...code... </tandem:edit>
 
-Loupe parses the stream for these markers and routes each span:
+Tandem parses the stream for these markers and routes each span:
 - prose → chat bubble;
 - **suggestion → shown in chat AND projectable into the buffer as ghost text** the
   user types over or applies (the least-automative mode — model proposes at a
@@ -355,13 +355,13 @@ OpenCode agents/skills are the native place to impose this (user already has
 `~/.config/opencode/skills` + agents; server exposes `/api/agent`, `/api/skill`).
 
 **Modes = injected agent/skill configs.** The autonomy dial (§3.4) is *implemented*
-by which agent Loupe injects: Coach = Socratic, tags suggestions, rarely commits;
+by which agent Tandem injects: Coach = Socratic, tags suggestions, rarely commits;
 Pair/Pilot/Auto = progressively more edit-committing. "Respond to fit what we're
 doing" = a per-context agent swap, chosen by mode + work package.
 
 **Same injection point as the journal:** the injected agent/system preamble carries
 BOTH the output contract AND the journal context (§3.6/§3.12) — one place where
-Loupe shapes how the model behaves and what it knows.
+Tandem shapes how the model behaves and what it knows.
 
 **Caveat:** marker reliability tracks model quality; the parser must degrade
 gracefully (untagged → prose).
@@ -373,16 +373,16 @@ gracefully (untagged → prose).
   from the mid-stream *interrupt-and-resume* of §3.2/§3.8, which is harder and comes
   later. Hard-cancel first.)
 - **Agent safety:** OpenCode's default agent is `build` — fully agentic with edit
-  and shell tools, so a stray sentence ("we're writing Loupe in Zig") can make it
+  and shell tools, so a stray sentence ("we're writing Tandem in Zig") can make it
   start *doing work* with no off switch. **The chat bubble defaults to the read-only
   `plan` agent** so plain conversation never edits files. Edit-capable agents
   (`build`) are opt-in via the autonomy dial (§3.4/§3.13): Coach/Pair = plan; Pilot/
   Auto = build. (Available agents incl. `build`, `plan`, `general`, `explore`.)
 - **The autonomy dial = two levers**, and the motivating failure is an AI deciding
-  on its own to do something big (e.g. "port Loupe to Zig") and just doing it:
+  on its own to do something big (e.g. "port Tandem to Zig") and just doing it:
   1. **agent selection** — `plan` (read-only) ↔ `build` (can edit);
   2. **decision/permission gating** — *even in build mode*, big moves hit a
-     permission gate (OpenCode `permission.asked`): Loupe pauses, asks "it wants to
+     permission gate (OpenCode `permission.asked`): Tandem pauses, asks "it wants to
      edit `foo.zig` — approve / step through / no?", and on approval opens the file
      and walks the edits (§3.3, §3.11). The `plan` default is an **interim
      guardrail** until this gating + typewriter-on-edits exists.
@@ -390,7 +390,7 @@ gracefully (untagged → prose).
 ### 3.10 Model routing & selection
 
 Different jobs want different models — a cheap/fast one for coach observations, a
-strong one for planning, the daily driver for general Q&A. Loupe needs:
+strong one for planning, the daily driver for general Q&A. Tandem needs:
 
 - **per-role default models** (ask / coach / plan / edit), configurable;
 - **live model switching mid-interaction**, like Claude Code / OpenCode (pick from
@@ -414,7 +414,7 @@ read/edit files). Three levels of treatment, in increasing difficulty:
    or override. This is the tool-side of §3.3 decision-gating.
 3. **Edit-application control (hard, later).** File-edit tools are special: this is
    where the typewriter belongs. But **OpenCode owns file writes**, so there's a
-   real tension between "OpenCode applies the edit" and "Loupe controls *how* it's
+   real tension between "OpenCode applies the edit" and "Tandem controls *how* it's
    applied (granularity, interrupt, walk-through)". Two strategies:
    - **Intercept via permission** — gate the edit tool, read the proposed content
      from the permission request, suppress OpenCode's own write, and apply it
@@ -424,7 +424,7 @@ read/edit files). Three levels of treatment, in increasing difficulty:
      reload, and replay the change as a typewriter *animation* (§3.5). Simpler, but
      the edit is already applied — no true mid-write interrupt.
    This is the single biggest open question in marrying OpenCode-as-engine with the
-   typewriter, and likely where Loupe eventually needs its own edit-application
+   typewriter, and likely where Tandem eventually needs its own edit-application
    layer. Tackle only after streaming + visibility + gating work.
 
 ---
@@ -480,7 +480,7 @@ switchable per-session or per-keybind:
 
 The backend does (for now). The "agentic loop" = the cycle of *send context →
 model replies / requests a tool → run tool → feed result back → repeat until
-done*. OpenCode and Claude both ship their own. Loupe drives theirs and owns the
+done*. OpenCode and Claude both ship their own. Tandem drives theirs and owns the
 **experience** on top. Rebuilding the loop by hand (possibly in Zig) is a great
 *later* learning phase — do not block the editor experience on it.
 
@@ -539,8 +539,8 @@ per-role routing (§3.10).
 - **TUI injection** (what `opencode.nvim` does): `POST /tui/publish`
   (`tui.prompt.append` then `tui.command.execute`/`prompt.submit`). Requires a
   running OpenCode **TUI** (headless no-ops silently); the reply renders *in the
-  TUI*, not in Neovim. **Wrong for Loupe** — we want the reply in the bubble.
-- **Headless programmatic prompt** (what Loupe needs): create session → `POST`
+  TUI*, not in Neovim. **Wrong for Tandem** — we want the reply in the bubble.
+- **Headless programmatic prompt** (what Tandem needs): create session → `POST`
   prompt → stream the assistant text back over SSE. This is the right path, but
   the exact run-triggering call was not nailed by hand (raw `POST
   /api/session/{id}/prompt` *admitted* but produced no output in tests). The
@@ -554,7 +554,7 @@ same stream carries `permission.asked` / `file.edited` events (validates §3.11)
 This means: **a thin sidecar after all** — the spike's "no sidecar" hope dies on
 the headless prompt-trigger; reintroduce a minimal SDK-based sidecar.
 
-**Sidecar — BUILT & WORKING (`loupe/sidecar/sidecar.mjs`).** Node + `@opencode-ai/sdk`.
+**Sidecar — BUILT & WORKING (`tandem/sidecar/sidecar.mjs`).** Node + `@opencode-ai/sdk`.
 `createOpencode({ port: 0 })` boots a server on a random port (port 0 is essential
 — the SDK defaults to 4096 and orphaned servers otherwise collide → `ServeError`;
 also must call `server.close()` on exit). Flow: `event.subscribe()` →
@@ -613,7 +613,7 @@ not yet built. Pieces and status:
   not real edits yet).
 - Streaming, located bubble, sessions/memory, model selection — **BUILT**.
 - **Gateway = §3.13 structured output** (NEXT): the model TAGS its edits (file +
-  content) and decisions, so Loupe can intercept them instead of letting OpenCode
+  content) and decisions, so Tandem can intercept them instead of letting OpenCode
   silently write.
 - **Headline = typewriter-on-edits (§3.11):** intercept a tagged edit (via
   permission), open the file, apply it through the *existing* typewriter. Hard part
