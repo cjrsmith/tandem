@@ -2032,6 +2032,10 @@ function M.new_session(name)
 	wp_write_manifest(m)
 	M.active_session = nil
 	M._usage = nil
+	-- fresh session → clear the command centre's transcript if it's open
+	if M._main and vim.api.nvim_buf_is_valid(M._main.conv_buf) then
+		M.render_transcript(M._main, nil)
+	end
 	M.rail_refresh()
 	vim.notify("Loupe: new session '" .. name .. "' in " .. m.active.wp)
 end
@@ -2087,6 +2091,11 @@ function M.activate_session(wp, key)
 	M.active_session = target.id
 	M._usage = nil
 	M._restore_backend(target.backend)
+	-- if the command centre is open, re-render it to show THIS session's conversation
+	if M._main and vim.api.nvim_buf_is_valid(M._main.conv_buf) then
+		M.render_transcript(M._main, M.active_session)
+		M.fetch_usage(M.active_session)
+	end
 	M.rail_refresh()
 	vim.notify("Loupe → " .. wp .. " ▸ " .. target.name)
 end
@@ -2782,6 +2791,11 @@ function M.pick_role()
 end
 
 function M.pick_level()
+	-- Level's MEANING depends on the mode: navigator = guidance grain, driver = autonomy.
+	if not LEVEL_TEXT[M.role] then
+		vim.notify("Loupe: '" .. M.role .. "' mode has no level — pick navigator or driver")
+		return
+	end
 	vim.ui.select({ "high", "medium", "low" }, {
 		prompt = (M.role == "navigator" and "Guidance" or "Autonomy") .. " level:",
 	}, function(l)
@@ -2836,7 +2850,8 @@ end
 -- Vim navigation + Enter come free from vim.ui.select; no bespoke window needed.
 function M.settings_menu()
 	local items = {
-		{ label = "Mode & level", run = M.pick_mode },
+		{ label = "Mode", run = M.pick_mode },
+		{ label = "Level", run = M.pick_level },
 		{ label = "Model", run = M.pick_model },
 		{ label = "Coach (toggle)", run = M.toggle_coach },
 		{ label = "Follow (toggle)", run = M.toggle_follow },
@@ -2976,8 +2991,41 @@ end
 -- ── Main chat window (central command centre) ───────────────────
 -- The full-size panel, tied to the ACTIVE working session — for planning, general
 -- conversation, history, and session/attribute management. Same shape as the bubbles.
+-- Clear a panel's transcript and re-render a session's prior messages into it (user
+-- messages as grey blocks, assistant plain). Used on open AND when the active session
+-- changes, so the main window always reflects the session you're looking at.
+function M.render_transcript(P, session)
+	if not (P and vim.api.nvim_buf_is_valid(P.conv_buf)) then
+		return
+	end
+	vim.api.nvim_buf_set_lines(P.conv_buf, 0, -1, false, {}) -- clear old transcript
+	vim.api.nvim_buf_clear_namespace(P.conv_buf, chat_ns, 0, -1) -- and its user-msg highlights
+	M.fetch_history(session, function(messages)
+		if not vim.api.nvim_buf_is_valid(P.conv_buf) or #messages == 0 then
+			return
+		end
+		for _, m in ipairs(messages) do
+			local txt = vim.trim((m.text or "")
+				:gsub("<loupe:suggest[^>]*>(.-)</loupe:suggest>", "%1")
+				:gsub("<loupe:notify>.-</loupe:notify>", "")
+				:gsub("<loupe:ask>.-</loupe:ask>", "")
+				:gsub("<loupe:instruction>.-</loupe:instruction>", ""))
+			if txt ~= "" then
+				if m.role == "user" then
+					P.append_user(txt)
+				else
+					local lines = vim.split(txt, "\n", { plain = true })
+					lines[#lines + 1] = ""
+					P.append(lines)
+				end
+			end
+		end
+	end)
+end
+
 function M.open_chat()
 	local P = make_panel(centre_box(), "loupe · conversation")
+	M._main = P -- the command centre; session switches re-render its transcript
 
 	vim.fn.prompt_setcallback(P.input_buf, function(input)
 		if input == "" then
@@ -3008,29 +3056,8 @@ function M.open_chat()
 		end)
 	end)
 
-	-- render the session's prior messages into the transcript on open (user messages
-	-- as grey blocks, assistant plain — same styling as live turns)
-	M.fetch_history(M.active_session, function(messages)
-		if not vim.api.nvim_buf_is_valid(P.conv_buf) or #messages == 0 then
-			return
-		end
-		for _, m in ipairs(messages) do
-			local txt = vim.trim((m.text or "")
-				:gsub("<loupe:suggest[^>]*>(.-)</loupe:suggest>", "%1")
-				:gsub("<loupe:notify>.-</loupe:notify>", "")
-				:gsub("<loupe:ask>.-</loupe:ask>", "")
-				:gsub("<loupe:instruction>.-</loupe:instruction>", ""))
-			if txt ~= "" then
-				if m.role == "user" then
-					P.append_user(txt)
-				else
-					local lines = vim.split(txt, "\n", { plain = true })
-					lines[#lines + 1] = ""
-					P.append(lines)
-				end
-			end
-		end
-	end)
+	-- render the session's prior messages into the transcript on open
+	M.render_transcript(P, M.active_session)
 
 	-- pull token/cost usage for the active session into the rail
 	M.fetch_usage(M.active_session)
