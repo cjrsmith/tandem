@@ -6,5 +6,4 @@ node_modules/
 
 # per-project runtime state (workpackage manifest, journals, backlog, sessions)
 .tandem/
-.loupe/
 

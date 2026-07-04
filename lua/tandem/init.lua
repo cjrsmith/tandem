@@ -119,20 +119,8 @@ end
 -- (M.new_session lives with the workpackage/session code below — it adds a fresh
 -- session to the ACTIVE workpackage.)
 
--- One-time migration: the project was renamed Loupe → Tandem. Earlier runs stored
--- per-project runtime state (workpackages, journals, backlog, sessions) under .loupe/;
--- move it to .tandem/ so nothing is lost.
-function M.migrate_from_loupe()
-	local old = vim.fn.getcwd() .. "/.loupe"
-	local new = vim.fn.getcwd() .. "/.tandem"
-	if vim.fn.isdirectory(old) == 1 and vim.fn.isdirectory(new) == 0 then
-		pcall(os.rename, old, new)
-	end
-end
-
 function M.setup(opts)
 	M.opts = opts or {}
-	pcall(M.migrate_from_loupe) -- Loupe → Tandem runtime-state migration
 	pcall(M.wp_load) -- adopt the active workpackage's session on startup
 end
 
