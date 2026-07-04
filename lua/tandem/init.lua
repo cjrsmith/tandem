@@ -2998,16 +2998,17 @@ function M.render_rail(buf, show_backlog)
 	header("⚙  SETTINGS")
 	add("")
 	setting("Mode", M.role)
-	if LEVEL_TEXT[M.role] then -- neutral has no level
-		setting("Level", M.level)
-	end
+	setting("Level", LEVEL_TEXT[M.role] and M.level or "—") -- neutral has no level
 	setting("Coach", M.coach and "on" or "off")
 	setting("Follow", M.follow and "on" or "off")
 	-- show the concrete resolved version (Claude aliases) so it's clear what's running
 	setting("Model", M.active_model and fit(M.active_model.resolved or M.active_model.label, 22) or "?")
-	if M.active_effort then -- reasoning effort, when the model supports it
-		setting("Effort", M.active_effort)
+	-- effort: the level when the model reasons, else it has no dial
+	local effort_val = "n/a"
+	if M.active_model and M.active_model.reasoning then
+		effort_val = M.active_effort or "default"
 	end
+	setting("Effort", effort_val)
 	setting("Backend", M.backend())
 	setting("Pace", M.granularity)
 	local wp_name, sess_name = "default", "session"
@@ -3050,17 +3051,16 @@ function M.render_rail(buf, show_backlog)
 		end
 	end
 
-	if M._usage then -- usage gets its OWN section at the bottom (context size + spend)
-		add("")
-		add("  ──────────────")
-		add("")
-		header("📊  USAGE")
-		add("")
-		local u = M._usage
-		local ctx = u.context or 0
-		setting("Context", ctx >= 1000 and (string.format("%.1fk", ctx / 1000)) or tostring(ctx))
-		setting("Cost", "$" .. string.format("%.4f", u.cost or 0))
-	end
+	-- usage gets its OWN section at the bottom — always shown ("—" until first fetched)
+	add("")
+	add("  ──────────────")
+	add("")
+	header("📊  USAGE")
+	add("")
+	local u = M._usage or {}
+	local ctx = u.context
+	setting("Context", ctx and (ctx >= 1000 and string.format("%.1fk", ctx / 1000) or tostring(ctx)) or "—")
+	setting("Cost", u.cost and ("$" .. string.format("%.4f", u.cost)) or "—")
 
 	add("")
 	add("")
