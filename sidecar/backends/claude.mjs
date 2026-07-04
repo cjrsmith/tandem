@@ -10,8 +10,8 @@
 // right here in the daemon and POST to the same HTTP bridge the OpenCode tools
 // use — so the typewriter / ask / notify / instruct plumbing is shared verbatim.
 //
-// Auth: the Agent SDK needs ANTHROPIC_API_KEY (or a logged-in Claude Code) in the
-// daemon's environment. If it's missing, prompts surface a friendly error.
+// Auth: the Agent SDK spawns the `claude` binary, which uses the user's Claude Code
+// login (a Pro/Max subscription works) — no API key needed in the daemon's environment.
 import {
   query,
   tool,
@@ -115,6 +115,28 @@ const NATIVE_WRITERS = ["Write", "Edit", "MultiEdit", "NotebookEdit"];
 // Auto-allowed (read-only, harmless) native tools — no permission prompt.
 const SAFE_TOOLS = new Set(["Read", "Grep", "Glob", "NotebookRead", "TodoWrite"]);
 
+// Reasoning effort → Claude thinking budget (same effort labels the OpenCode side uses).
+// undefined → omit, let the SDK/model decide.
+function effortToThinking(effort) {
+  switch (effort) {
+    case "minimal": return { type: "disabled" };
+    case "low": return { type: "enabled", budgetTokens: 4000 };
+    case "medium": return { type: "enabled", budgetTokens: 12000 };
+    case "high": return { type: "enabled", budgetTokens: 32000 };
+    default: return undefined;
+  }
+}
+
+// Claude models offered in the picker. All support reasoning (thinking). Uses the
+// user's Claude Code login (no API key) — the SDK spawns the claude binary.
+function listModels() {
+  return [
+    { backend: "claude", providerID: "anthropic", modelID: "claude-opus-4-8", label: "Claude · Opus 4.8", reasoning: true },
+    { backend: "claude", providerID: "anthropic", modelID: "claude-sonnet-4-6", label: "Claude · Sonnet 4.6", reasoning: true },
+    { backend: "claude", providerID: "anthropic", modelID: "claude-haiku-4-5-20251001", label: "Claude · Haiku 4.5", reasoning: true },
+  ];
+}
+
 // A short "what the AI is doing now" label from a tool call (parallels toolLabel
 // in daemon.mjs; here we get MCP-prefixed names, so strip the prefix first).
 function toolLabel(name, input = {}) {
@@ -192,6 +214,7 @@ export function createClaudeBackend({ send, cwd, defaultSystem, requestPermissio
         disallowedTools: disallowed,
         permissionMode: "default",
         canUseTool,
+        thinking: effortToThinking(cmd.effort), // reasoning effort → thinking budget
         includePartialMessages: true,
         abortController: abort,
         env: { ...process.env },
@@ -293,5 +316,5 @@ export function createClaudeBackend({ send, cwd, defaultSystem, requestPermissio
     }
   }
 
-  return { handlePrompt, cancel, cancelAll, history, usage, compact };
+  return { handlePrompt, cancel, cancelAll, history, usage, compact, listModels };
 }

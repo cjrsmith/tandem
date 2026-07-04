@@ -64,46 +64,76 @@ end
 M.active_session = nil -- the current working session, shared across bubbles
 M.active_edit = nil -- { buf, srow, erow } — where the AI is currently writing code
 
--- Available models for the picker; M.active_model is what new prompts use. Each
--- model names its `backend` — the daemon routes on it (opencode vs the Claude
--- Agent SDK). Selecting a Claude model IS how you switch backends; the rail shows
--- the active one. Claude models need ANTHROPIC_API_KEY in the daemon's env.
+-- Models for the picker. This is a FALLBACK; M.fetch_models replaces it with the models
+-- actually available through the backends (OpenCode providers + Claude). Each entry:
+-- { label, backend, providerID, modelID, reasoning }. `backend` routes the daemon
+-- (opencode vs the Claude Agent SDK); picking a Claude model switches backend. Claude
+-- uses your Claude Code login — no API key.
 M.models = {
-	{ label = "GPT-5.5", backend = "opencode", providerID = "openai", modelID = "gpt-5.5" },
-	{ label = "GPT-5.5 fast", backend = "opencode", providerID = "openai", modelID = "gpt-5.5-fast" },
-	{ label = "GPT-5.4 mini", backend = "opencode", providerID = "openai", modelID = "gpt-5.4-mini" },
-	{ label = "zen free", backend = "opencode", providerID = "opencode", modelID = "north-mini-code-free" },
-	{ label = "Claude Opus 4.8", backend = "claude", providerID = "anthropic", modelID = "claude-opus-4-8" },
-	{ label = "Claude Sonnet 4.6", backend = "claude", providerID = "anthropic", modelID = "claude-sonnet-4-6" },
-	{ label = "Claude Haiku 4.5", backend = "claude", providerID = "anthropic", modelID = "claude-haiku-4-5-20251001" },
+	{ label = "GPT-5.5", backend = "opencode", providerID = "openai", modelID = "gpt-5.5", reasoning = true },
+	{ label = "zen free", backend = "opencode", providerID = "opencode", modelID = "north-mini-code-free", reasoning = false },
+	{ label = "Claude · Opus 4.8", backend = "claude", providerID = "anthropic", modelID = "claude-opus-4-8", reasoning = true },
 }
-M.active_model = M.models[1] -- default: GPT-5.5 (clean output, follows instructions)
+M.active_model = M.models[1]
+M.active_effort = nil -- reasoning effort (nil = model default); only for reasoning models
+M.effort_levels = { "default", "minimal", "low", "medium", "high" }
 
 -- The active backend, derived from the selected model (defaults to opencode).
 function M.backend()
 	return (M.active_model and M.active_model.backend) or "opencode"
 end
 
--- Pick the active model; subsequent prompts use it. Crossing backends is allowed
--- (it just means the next session runs on the other backend).
+-- Choose reasoning effort for the active model (models that support it). "default"
+-- clears it (let the model decide). Applied per-turn: Claude→thinking, OpenCode→config.
+function M.pick_effort()
+	if not (M.active_model and M.active_model.reasoning) then
+		vim.notify("Tandem: " .. (M.active_model and (M.active_model.label or M.active_model.modelID) or "this model") .. " has no reasoning-effort dial")
+		return
+	end
+	vim.ui.select(M.effort_levels, { prompt = "Reasoning effort:" }, function(choice)
+		if not choice then
+			return
+		end
+		M.active_effort = (choice ~= "default") and choice or nil
+		vim.notify("Tandem effort → " .. choice)
+		M.rail_refresh()
+	end)
+end
+
+-- Pick the active model (fetched live from the backends), then — like mode → level —
+-- cascade into an effort choice if the model supports reasoning. Crossing backends
+-- moves to a session on that backend.
 function M.pick_model()
-	vim.ui.select(M.models, {
-		prompt = "Tandem model:",
-		format_item = function(m)
-			return m.label .. "  (" .. (m.backend or "opencode") .. ")"
-		end,
-	}, function(choice)
-		if choice then
+	M.fetch_models(function()
+		vim.ui.select(M.models, {
+			prompt = "Tandem model:",
+			format_item = function(m)
+				return (m.label or m.modelID)
+					.. "  ("
+					.. (m.backend or "opencode")
+					.. (m.reasoning and " · reasoning" or "")
+					.. ")"
+			end,
+		}, function(choice)
+			if not choice then
+				return
+			end
 			local switched = M.backend() ~= choice.backend
 			M.active_model = choice
+			if not choice.reasoning then
+				M.active_effort = nil -- this model has no effort dial
+			end
 			if switched then
 				-- backend is bound to the session (ids can't cross-resume) → move to a
 				-- session on the new backend in this workpackage (reuse or create).
 				pcall(M.switch_backend, choice.backend)
 			end
-			vim.notify("Tandem model → " .. choice.label .. (switched and ("  [" .. choice.backend .. "]") or ""))
+			vim.notify("Tandem model → " .. (choice.label or choice.modelID) .. (switched and ("  [" .. choice.backend .. "]") or ""))
 			M.rail_refresh()
-		end
+			if choice.reasoning then
+				M.pick_effort() -- cascade to effort
+			end
+		end)
 	end)
 end
 
@@ -1811,6 +1841,7 @@ function M.prompt(session, text, on_event, fork, opts)
 		fork = fork,
 		backend = M.backend(),
 		model = M.active_model and { providerID = M.active_model.providerID, modelID = M.active_model.modelID } or nil,
+		effort = M.active_effort, -- reasoning effort (nil = model default)
 		system = opts.system or M.build_system(), -- per-role behaviour from the agent files
 		agent = opts.agent or (({ navigator = "plan", neutral = "build", driver = "build" })[M.role] or "build"),
 		-- Driver writes ONLY through tandem_write (watchable typewriter) — disable the
@@ -1818,6 +1849,41 @@ function M.prompt(session, text, on_event, fork, opts)
 		tools = opts.tools ~= nil and opts.tools
 			or ((M.role == "driver") and { write = false, edit = false, patch = false } or nil),
 	})
+end
+
+-- Fetch the models actually available from the backends (OpenCode providers + Claude),
+-- replacing the fallback list. Cached after the first successful fetch. cb() when ready.
+function M.fetch_models(cb)
+	if M._models_fetched then
+		if cb then
+			cb()
+		end
+		return
+	end
+	daemon.n = daemon.n + 1
+	local tag = "ml" .. daemon.n
+	daemon.handlers[tag] = function(msg)
+		if msg.type == "models" then
+			daemon.handlers[tag] = nil
+			if msg.models and #msg.models > 0 then
+				M.models = msg.models
+				M._models_fetched = true
+			end
+			if cb then
+				cb()
+			end
+		end
+	end
+	send_cmd({ cmd = "list_models", tag = tag })
+	-- don't hang forever if the daemon can't answer — fall back after a moment
+	vim.defer_fn(function()
+		if daemon.handlers[tag] then
+			daemon.handlers[tag] = nil
+			if cb then
+				cb()
+			end
+		end
+	end, 4000)
 end
 
 -- Fetch a session's prior messages; cb(messages) with a list of { role, text }.
@@ -2824,6 +2890,7 @@ function M.settings_menu()
 		{ label = "Mode", run = M.pick_mode },
 		{ label = "Level", run = M.pick_level },
 		{ label = "Model", run = M.pick_model },
+		{ label = "Effort (reasoning)", run = M.pick_effort },
 		{ label = "Coach (toggle)", run = M.toggle_coach },
 		{ label = "Follow (toggle)", run = M.toggle_follow },
 		{ label = "Typing pace", run = M.pick_granularity },

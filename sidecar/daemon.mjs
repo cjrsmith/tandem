@@ -22,7 +22,7 @@ import os from "node:os";
 import path from "node:path";
 
 const MODEL = { providerID: "opencode", modelID: "north-mini-code-free" };
-const VERSION = "2026-07-03 tool-permissions";
+const VERSION = "2026-07-04 models+effort";
 
 // tandem_instruct: the Navigator gives the human ONE directive (a next step). Sticky,
 // non-blocking — shown in the notification bar until dismissed / next asked.
@@ -294,11 +294,63 @@ debug("tandem bridge on", bridge.address().port);
 // Gate side-effecting native tools behind a human OK (bash, webfetch). Reads/greps
 // stay auto-allowed; Tandem's own tools have their own gate (the typewriter). This
 // makes OpenCode raise permission.updated events we relay to the editor.
-const { client, server } = await createOpencode({
-  port: 0,
-  config: { permission: { bash: "ask", webfetch: "ask" } },
-});
+// Kept mutable so config.update (for per-model reasoning effort) can resend the WHOLE
+// config and never accidentally drop the permission rules.
+const daemonConfig = { permission: { bash: "ask", webfetch: "ask" } };
+const { client, server } = await createOpencode({ port: 0, config: daemonConfig });
 debug("daemon up at", server.url);
+
+// Apply a reasoning effort to an OpenCode model by setting its options.reasoningEffort
+// and pushing the whole config live (what the TUI's Ctrl+T does under the hood).
+async function setOpencodeEffort(model, effort) {
+  if (!model || !model.providerID || !model.modelID) return;
+  daemonConfig.provider = daemonConfig.provider || {};
+  const prov = (daemonConfig.provider[model.providerID] = daemonConfig.provider[model.providerID] || {});
+  prov.models = prov.models || {};
+  const m = (prov.models[model.modelID] = prov.models[model.modelID] || {});
+  m.options = m.options || {};
+  if (effort) m.options.reasoningEffort = effort;
+  else delete m.options.reasoningEffort;
+  try {
+    await client.config.update({ body: daemonConfig });
+  } catch (e) {
+    debug("config.update (effort) failed", e);
+  }
+}
+
+// List the models actually available through the backends (no hardcoding in Neovim):
+// every OpenCode provider's models (tagged with whether they support reasoning), plus
+// the Claude backend's models. Sent back as { type:"models", models:[…] }.
+async function listModels(tag) {
+  const out = [];
+  try {
+    const res = await client.config.providers();
+    const providers = (res.data && res.data.providers) || [];
+    for (const prov of providers) {
+      const models = prov.models || {};
+      const entries = Array.isArray(models) ? models : Object.values(models);
+      for (const m of entries) {
+        if (!m || !m.id) continue;
+        out.push({
+          backend: "opencode",
+          providerID: prov.id || m.providerID,
+          modelID: m.id,
+          label: (prov.name ? prov.name + " · " : "") + (m.name || m.id),
+          reasoning: !!(m.capabilities && m.capabilities.reasoning),
+        });
+      }
+    }
+  } catch (e) {
+    debug("opencode providers failed", e);
+  }
+  try {
+    const b = await getClaude();
+    for (const m of b.listModels()) out.push(m);
+  } catch (e) {
+    debug("claude listModels failed", e);
+  }
+  send({ tag, type: "models", models: out });
+}
 
 // ── Tool-permission bridge ──────────────────────────────────────
 // Both backends funnel "may I run this tool?" through here: we ask the editor and
@@ -411,6 +463,11 @@ async function handlePrompt(cmd) {
   }
   active.set(sid, { tag: cmd.tag });
   send({ tag: cmd.tag, type: "session", id: sid });
+  // Reasoning effort: OpenCode reads it from the model's config options, so push it
+  // live before the turn (the model carries whether it's applicable).
+  if (cmd.model && cmd.effort !== undefined) {
+    await setOpencodeEffort(cmd.model, cmd.effort);
+  }
   // Reusing `sid` here is the whole point: the session keeps its history.
   // Default to the read-only `plan` agent so a chat turn never edits files;
   // edit-capable agents (e.g. "build") are opt-in via cmd.agent later (§3.13).
@@ -426,9 +483,9 @@ async function handlePrompt(cmd) {
   });
 }
 
-// The Claude backend (Agent SDK) is loaded lazily the first time a command asks
-// for it, so the OpenCode path never pays for it and a missing API key only bites
-// when Claude is actually selected. It speaks the same event protocol as above.
+// The Claude backend (Agent SDK) is loaded lazily the first time a command asks for
+// it, so the OpenCode path never pays for it. It uses the user's Claude Code login
+// (the SDK spawns the claude binary) — no API key. Speaks the same event protocol.
 let claudeBackend = null;
 async function getClaude() {
   if (!claudeBackend) {
@@ -445,7 +502,9 @@ rl.on("line", (line) => {
   let cmd;
   try { cmd = JSON.parse(line); } catch { return; }
   const claude = cmd.backend === "claude"; // route session-scoped commands per backend
-  if (cmd.cmd === "prompt") {
+  if (cmd.cmd === "list_models") {
+    listModels(cmd.tag);
+  } else if (cmd.cmd === "prompt") {
     if (claude) {
       getClaude().then((b) => b.handlePrompt(cmd)).catch((e) => send({ tag: cmd.tag, type: "error", error: String(e) }));
     } else {
