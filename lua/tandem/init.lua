@@ -753,6 +753,49 @@ local function make_panel(box, title_label)
 		return start
 	end
 
+	-- Streaming reply: text arrives in deltas and is rewritten in place inside a growing
+	-- block. `commit_stream` finalizes the current block so the NEXT delta (or an injected
+	-- tool block) starts fresh below — that's how tool calls interleave with the reply.
+	P._sr, P._sc, P._sacc = nil, 0, "" -- stream: start line, line count, accumulated text
+	function P.stream_delta(text)
+		if not vim.api.nvim_buf_is_valid(conv_buf) then
+			return
+		end
+		P._sacc = P._sacc .. text
+		local lines = vim.split(P._sacc, "\n", { plain = true })
+		if not P._sr then
+			P._sr = vim.api.nvim_buf_line_count(conv_buf)
+			P._sc = 0
+		end
+		vim.api.nvim_buf_set_lines(conv_buf, P._sr, P._sr + P._sc, false, lines)
+		P._sc = #lines
+		if vim.api.nvim_win_is_valid(conv_win) and vim.api.nvim_get_current_win() ~= conv_win then
+			vim.api.nvim_win_set_cursor(conv_win, { vim.api.nvim_buf_line_count(conv_buf), 0 })
+		end
+	end
+	function P.commit_stream()
+		if P._sr and vim.api.nvim_buf_is_valid(conv_buf) then
+			local text = vim.trim(P._sacc)
+			local lines = text == "" and {} or vim.split(text, "\n", { plain = true })
+			if #lines > 0 then
+				lines[#lines + 1] = ""
+			end
+			vim.api.nvim_buf_set_lines(conv_buf, P._sr, P._sr + P._sc, false, lines)
+		end
+		P._sr, P._sc, P._sacc = nil, 0, ""
+	end
+	-- Inject a tool-call block (dim), committing any in-progress reply first so it lands
+	-- in chronological order between reply segments.
+	function P.append_tool(lines)
+		P.commit_stream()
+		local start = P.append(lines)
+		if start then
+			for i = start, start + #lines - 1 do
+				pcall(vim.api.nvim_buf_set_extmark, conv_buf, chat_ns, i, 0, { line_hl_group = "TandemRailLabel" })
+			end
+		end
+	end
+
 	-- append YOUR message as a grey-highlighted block (no "you ▸" prefix).
 	function P.append_user(text)
 		local lines = vim.split(text, "\n", { plain = true })
@@ -795,7 +838,8 @@ end
 local function panel_turn(P, session, user_text, prompt_text, on_session, on_done, fork, opts)
 	P.append_user(user_text)
 	prompt_text = M.resolve_refs(prompt_text) -- pull in any @file references
-	local acc, r_start, r_count = "", nil, nil
+	P.commit_stream() -- clean slate
+	local acc = ""
 	M.prompt(session, prompt_text, function(msg)
 		if msg.type == "session" then
 			if on_session then
@@ -803,26 +847,9 @@ local function panel_turn(P, session, user_text, prompt_text, on_session, on_don
 			end
 		elseif msg.type == "delta" then
 			acc = acc .. msg.text
-			if not vim.api.nvim_buf_is_valid(P.conv_buf) then
-				return -- panel closed mid-stream; stop touching it
-			end
-			local lines = vim.split(acc, "\n", { plain = true })
-			if not r_start then
-				r_start = vim.api.nvim_buf_line_count(P.conv_buf)
-				r_count = 0
-			end
-			vim.api.nvim_buf_set_lines(P.conv_buf, r_start, r_start + r_count, false, lines)
-			r_count = #lines
-			if vim.api.nvim_win_is_valid(P.conv_win) and vim.api.nvim_get_current_win() ~= P.conv_win then
-				vim.api.nvim_win_set_cursor(P.conv_win, { vim.api.nvim_buf_line_count(P.conv_buf), 0 })
-			end
+			P.stream_delta(msg.text) -- rewrites the growing reply block (tool blocks can interleave)
 		elseif msg.type == "done" then
-			if r_start and vim.api.nvim_buf_is_valid(P.conv_buf) then
-				local lines = vim.split(vim.trim(acc), "\n", { plain = true })
-				lines[#lines + 1] = ""
-				vim.api.nvim_buf_set_lines(P.conv_buf, r_start, r_start + r_count, false, lines)
-				r_count = #lines
-			end
+			P.commit_stream()
 			if on_done then
 				on_done(acc)
 			end
@@ -1527,6 +1554,7 @@ end
 -- as the tool result so the agent continues.
 function M.on_ask(msg)
 	local question = msg.question or "?"
+	M._main_note({ "❓ " .. question })
 	-- A forked side-chat at the bottom of the screen: DISCUSS the question with a fork
 	-- (which has the full context) via Enter, then ^S to send your final answer — that
 	-- unblocks the original agent. The main agent stays frozen the whole time.
@@ -1606,6 +1634,7 @@ end
 function M.on_notify(msg)
 	if msg.message and msg.message ~= "" then
 		M.toast(msg.message)
+		M._main_note({ "💬 " .. msg.message })
 	end
 end
 
@@ -1642,6 +1671,7 @@ function M.on_instruct(msg)
 		return
 	end
 	M.last_instruction = instr
+	M._main_note({ "▸ " .. instr })
 
 	local W = math.floor(vim.o.columns * 0.7)
 	local H = math.min(16, vim.o.lines - 4)
@@ -2790,8 +2820,10 @@ end
 -- A tool call happened (running/done/error). Append to the activity log (+ later the
 -- main transcript). Routed from on_stdout.
 function M.on_tool(msg)
+	local lines = tool_log_lines(msg)
+	-- bottom activity bar (all sessions)
 	local log = M._toollog
-	for _, l in ipairs(tool_log_lines(msg)) do
+	for _, l in ipairs(lines) do
 		log.lines[#log.lines + 1] = l
 	end
 	while #log.lines > 300 do
@@ -2799,6 +2831,18 @@ function M.on_tool(msg)
 	end
 	if log.on then
 		toollog_render()
+	end
+	-- main chat = source of truth: weave tool calls into the ACTIVE session's transcript
+	if M._main and vim.api.nvim_buf_is_valid(M._main.conv_buf) and msg.session and msg.session == M.active_session then
+		M._main.append_tool(lines)
+	end
+end
+
+-- Append a session-activity note (a question / notification / instruction) to the main
+-- chat transcript, so it's a source of truth — these also show as toasts/side-chats.
+function M._main_note(lines)
+	if M._main and vim.api.nvim_buf_is_valid(M._main.conv_buf) then
+		M._main.append_tool(lines)
 	end
 end
 
