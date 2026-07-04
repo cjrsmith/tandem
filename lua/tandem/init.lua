@@ -2327,9 +2327,17 @@ function M.capture_plan()
 		return
 	end
 	M.toast("✎ capturing our plan into the journal + backlog…")
+	local journal = M.read_journal()
+	local current = journal ~= "" and ("Here is the workpackage's CURRENT journal:\n\n" .. journal .. "\n\n") or ""
 	M.run(
 		M.active_session,
-		"Based on our conversation so far, curate this workpackage's shared memory: call tandem_journal with a concise, up-to-date brief (goal, current state, key decisions, approach & constraints), and call tandem_backlog to add any concrete tasks we've identified. Keep the journal tight — it's injected into every session."
+		current
+			.. "Update this workpackage's shared memory from our conversation so far. Call tandem_journal "
+			.. "with the COMPLETE updated brief (goal, current state, key decisions, approach & constraints): "
+			.. "KEEP the existing content that still holds — especially decisions and context that aren't in "
+			.. "this conversation — MERGE in what we've just discussed, and prune only what's genuinely outdated. "
+			.. "Do NOT rewrite from scratch or drop prior context. Then call tandem_backlog to add any concrete "
+			.. "new tasks. Keep the journal tight — it's injected into every session."
 	)
 end
 

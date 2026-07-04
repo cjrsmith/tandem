@@ -40,8 +40,10 @@ pick up where the last left off) and a **backlog** (the task checklist). Both ar
 to help maintain, using tools:
 
 - **`tandem_journal`** — pass the COMPLETE updated journal markdown; it replaces the old
-  one. Keep it TIGHT: capture decisions and the current state, not a play-by-play. The
-  journal is injected into every session, so bloat costs context on every turn.
+  one, so first READ the current journal and preserve what still holds — merge in new
+  decisions, prune only what's genuinely outdated, never discard prior context that isn't
+  in this conversation. Keep it TIGHT: decisions and current state, not a play-by-play.
+  The journal is injected into every session, so bloat costs context on every turn.
 - **`tandem_backlog`** — `add` new concrete tasks as they emerge; `complete` tasks (by
   their text) as you finish them. This never rewrites the list, so the human's ordering
   and edits are preserved.

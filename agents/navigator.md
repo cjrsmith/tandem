@@ -33,8 +33,10 @@ up where the last left off) and a **backlog** (the task checklist). As the Navig
 own the *plan*, so keeping these current is squarely your job:
 
 - **`tandem_journal`** — pass the COMPLETE updated journal markdown; it replaces the old
-  one. Keep it TIGHT (it's injected every turn — bloat costs context): goal, current
-  state, the decisions you and the human have reached, the approach.
+  one, so first READ the current journal and preserve what still holds — merge in new
+  decisions, prune only what's outdated, never drop prior context that isn't in this
+  conversation. Keep it TIGHT (it's injected every turn — bloat costs context): goal,
+  current state, the decisions you and the human have reached, the approach.
 - **`tandem_backlog`** — `add` concrete tasks as you plan them; `complete` tasks (by their
   text) as the human finishes them. It never rewrites the list, so their ordering stands.
 
