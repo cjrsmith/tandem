@@ -156,7 +156,8 @@ async function listModels() {
       return models.map((m) => ({
         backend: "claude",
         providerID: "anthropic",
-        modelID: m.value,
+        modelID: m.value, // the alias (e.g. "opus") — always resolves to the latest of that family
+        resolved: m.resolvedModel, // the concrete version it maps to right now (e.g. "claude-opus-4-8")
         label: "Claude · " + (m.displayName || m.value),
         reasoning: true, // Claude models support thinking
       }));

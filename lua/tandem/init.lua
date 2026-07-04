@@ -109,6 +109,7 @@ function M.pick_model()
 			prompt = "Tandem model:",
 			format_item = function(m)
 				return (m.label or m.modelID)
+					.. (m.resolved and ("  → " .. m.resolved) or "") -- alias → concrete version
 					.. "  ("
 					.. (m.backend or "opencode")
 					.. (m.reasoning and " · reasoning" or "")
@@ -2978,7 +2979,8 @@ function M.render_rail(buf, show_backlog)
 	end
 	setting("Coach", M.coach and "on" or "off")
 	setting("Follow", M.follow and "on" or "off")
-	setting("Model", M.active_model and M.active_model.label or "?")
+	-- show the concrete resolved version (Claude aliases) so it's clear what's running
+	setting("Model", M.active_model and fit(M.active_model.resolved or M.active_model.label, 22) or "?")
 	if M.active_effort then -- reasoning effort, when the model supports it
 		setting("Effort", M.active_effort)
 	end
