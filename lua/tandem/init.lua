@@ -18,6 +18,13 @@ local chat_ns = vim.api.nvim_create_namespace("tandem_chat") -- user-message bac
 -- Subtle grey block behind YOUR messages in chat (like opencode/claude); overridable.
 vim.api.nvim_set_hl(0, "TandemUserMsg", { bg = "#2b2b33", default = true })
 
+-- Attribute-rail colouring: section headers, setting LABELS (muted) vs their VALUES
+-- (bright), so you can tell the field from its current choice at a glance. Overridable.
+local rail_ns = vim.api.nvim_create_namespace("tandem_rail")
+vim.api.nvim_set_hl(0, "TandemRailHeader", { link = "Title", default = true })
+vim.api.nvim_set_hl(0, "TandemRailLabel", { link = "Comment", default = true })
+vim.api.nvim_set_hl(0, "TandemRailValue", { link = "Identifier", default = true })
+
 -- Mark a window as a Tandem surface (chat bubble / ask / instruction / command centre)
 -- so M.toggle_focus can cycle between them and your code without closing anything.
 local function mark_surface(win)
@@ -2878,38 +2885,50 @@ function M.render_rail(buf, show_backlog)
 		end
 		return s .. "…"
 	end
-	local lines = {
-		"",
-		"  ⚙  SETTINGS",
-		"",
-		"  Mode     " .. M.role,
-	}
-	if LEVEL_TEXT[M.role] then -- neutral has no level
-		lines[#lines + 1] = "  Level    " .. M.level
+	-- Build lines while recording highlight spans, so labels and values get different
+	-- colours. `hls` = { {line, s, e, hl}, … } (0-indexed line, byte cols; e=-1 → EOL).
+	local lines, hls = {}, {}
+	local function add(text)
+		lines[#lines + 1] = text or ""
+		return #lines - 1 -- 0-indexed line just added
 	end
-	lines[#lines + 1] = "  Coach    " .. (M.coach and "on" or "off")
-	lines[#lines + 1] = "  Follow   " .. (M.follow and "on" or "off")
-	lines[#lines + 1] = "  Model    " .. (M.active_model and M.active_model.label or "?")
-	lines[#lines + 1] = "  Backend  " .. M.backend()
-	lines[#lines + 1] = "  Pace     " .. M.granularity
+	local function header(text)
+		hls[#hls + 1] = { line = add("  " .. text), s = 0, e = -1, hl = "TandemRailHeader" }
+	end
+	local function setting(label, value)
+		local prefix = "  " .. label .. string.rep(" ", math.max(1, 9 - #label))
+		local line = add(prefix .. (value or ""))
+		hls[#hls + 1] = { line = line, s = 2, e = 2 + #label, hl = "TandemRailLabel" }
+		hls[#hls + 1] = { line = line, s = #prefix, e = -1, hl = "TandemRailValue" }
+	end
+
+	add("")
+	header("⚙  SETTINGS")
+	add("")
+	setting("Mode", M.role)
+	if LEVEL_TEXT[M.role] then -- neutral has no level
+		setting("Level", M.level)
+	end
+	setting("Coach", M.coach and "on" or "off")
+	setting("Follow", M.follow and "on" or "off")
+	setting("Model", M.active_model and M.active_model.label or "?")
+	if M.active_effort then -- reasoning effort, when the model supports it
+		setting("Effort", M.active_effort)
+	end
+	setting("Backend", M.backend())
+	setting("Pace", M.granularity)
 	local wp_name, sess_name = "default", "session"
 	pcall(function()
 		wp_name = M.wp_active()
 		sess_name = M.session_name()
 	end)
-	lines[#lines + 1] = "  Package  " .. fit(wp_name, 22)
-	lines[#lines + 1] = "  Session  " .. fit(sess_name .. (M.active_session and "" or "  · new"), 22)
-	if M._usage then -- context size + spend for the active session
-		local u = M._usage
-		local ctx = u.context or 0
-		local ctx_s = ctx >= 1000 and (string.format("%.1fk", ctx / 1000)) or tostring(ctx)
-		lines[#lines + 1] = "  Context  " .. ctx_s
-		lines[#lines + 1] = "  Cost     $" .. string.format("%.4f", u.cost or 0)
-	end
+	setting("Package", fit(wp_name, 22))
+	setting("Session", fit(sess_name .. (M.active_session and "" or "  · new"), 22))
+
 	if show_backlog then -- the command centre shows the workpackage backlog (top few)
-		lines[#lines + 1] = ""
-		lines[#lines + 1] = "  ──────────────"
-		lines[#lines + 1] = ""
+		add("")
+		add("  ──────────────")
+		add("")
 		local items = M.backlog_parse()
 		local open = 0
 		for _, it in ipairs(items) do
@@ -2917,15 +2936,15 @@ function M.render_rail(buf, show_backlog)
 				open = open + 1
 			end
 		end
-		lines[#lines + 1] = "  🗒  BACKLOG" .. (open > 0 and ("  (" .. open .. ")") or "")
-		lines[#lines + 1] = ""
+		header("🗒  BACKLOG" .. (open > 0 and ("  (" .. open .. ")") or ""))
+		add("")
 		if #items == 0 then
-			lines[#lines + 1] = "  (empty — " .. M.prefix .. "b)"
+			add("  (empty — " .. M.prefix .. "b)")
 		else
 			local shown = 0
 			for _, it in ipairs(items) do -- priority order = file order
 				if not it.done then
-					lines[#lines + 1] = "  ☐ " .. fit(it.text, 22)
+					add("  ☐ " .. fit(it.text, 22))
 					shown = shown + 1
 					if shown >= 6 then
 						break
@@ -2933,18 +2952,37 @@ function M.render_rail(buf, show_backlog)
 				end
 			end
 			if shown == 0 then
-				lines[#lines + 1] = "  ✓ all done"
+				add("  ✓ all done")
 			end
 		end
 	end
-	lines[#lines + 1] = ""
-	lines[#lines + 1] = ""
-	lines[#lines + 1] = "  Tab  switch pane"
-	lines[#lines + 1] = "  ?    settings"
-	lines[#lines + 1] = "  q    close"
+
+	if M._usage then -- usage gets its OWN section at the bottom (context size + spend)
+		add("")
+		add("  ──────────────")
+		add("")
+		header("📊  USAGE")
+		add("")
+		local u = M._usage
+		local ctx = u.context or 0
+		setting("Context", ctx >= 1000 and (string.format("%.1fk", ctx / 1000)) or tostring(ctx))
+		setting("Cost", "$" .. string.format("%.4f", u.cost or 0))
+	end
+
+	add("")
+	add("")
+	add("  Tab  switch pane")
+	add("  ?    settings")
+	add("  q    close")
+
 	vim.bo[buf].modifiable = true
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
 	vim.bo[buf].modifiable = false
+	vim.api.nvim_buf_clear_namespace(buf, rail_ns, 0, -1)
+	for _, h in ipairs(hls) do
+		local e = h.e == -1 and #(lines[h.line + 1]) or h.e
+		pcall(vim.api.nvim_buf_set_extmark, buf, rail_ns, h.line, h.s, { end_col = e, hl_group = h.hl })
+	end
 end
 
 -- Re-render the rail if the command centre is open (settings changed elsewhere).
