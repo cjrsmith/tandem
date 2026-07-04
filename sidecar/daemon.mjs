@@ -185,14 +185,16 @@ export default tool({
 })
 `;
 
-// The structured-output contract (§3.13). Makes the model mark code meant for the
-// file so Tandem can route it (e.g. to ghost text) instead of leaving it as prose.
+// Fallback system prompt — only used if Neovim doesn't send a per-role one (it
+// normally does, via build_system). Code goes in fenced markdown blocks, which Tandem
+// captures to offer as ghost text; edits into the buffer happen through the tandem_*
+// tools, never prose tags.
 const SYSTEM = [
   "You are assisting inside a code editor; the user reads your reply in a small chat bubble.",
-  "When part of your answer is concrete code the user could insert into their current file,",
-  "wrap ONLY that code in <tandem:suggest> and </tandem:suggest> tags, each tag on its own line.",
-  "Keep ALL explanation as normal prose OUTSIDE the tags.",
-  "Do NOT tag tiny inline snippets that are part of a sentence — only standalone code blocks meant for the file.",
+  "When part of your answer is concrete code the user could put in a file, place it in a fenced",
+  "``` markdown code block, with all explanation as prose OUTSIDE the fences. Tandem captures",
+  "fenced blocks so the user can project one as ghost text at their cursor.",
+  "Do NOT fence tiny inline snippets that are part of a sentence — only standalone code blocks.",
 ].join("\n");
 
 function send(obj) {
