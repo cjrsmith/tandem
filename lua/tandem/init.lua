@@ -2132,6 +2132,7 @@ function M.set_active_session(id)
 	if e then
 		e.id = id
 		e.backend = M.backend()
+		e.lastUsed = os.time()
 		wp_write_manifest(m)
 	end
 end
@@ -2143,7 +2144,7 @@ function M.new_session(name)
 	local sessions = m.packages[m.active.wp].sessions
 	name = (name and vim.trim(name) ~= "" and vim.trim(name)) or ("session " .. (#sessions + 1))
 	local key = new_key()
-	sessions[#sessions + 1] = { key = key, name = name, id = nil, backend = M.backend() }
+	sessions[#sessions + 1] = { key = key, name = name, id = nil, backend = M.backend(), lastUsed = os.time() }
 	m.active.key = key
 	wp_write_manifest(m)
 	M.active_session = nil
@@ -2168,7 +2169,7 @@ function M.wp_create(name)
 		return
 	end
 	local key = new_key()
-	m.packages[name] = { sessions = { { key = key, name = "session 1", id = nil, backend = M.backend() } } }
+	m.packages[name] = { sessions = { { key = key, name = "session 1", id = nil, backend = M.backend(), lastUsed = os.time() } } }
 	m.active = { wp = name, key = key }
 	wp_write_manifest(m)
 	vim.fn.mkdir(wp_dir(name), "p")
@@ -2203,6 +2204,7 @@ function M.activate_session(wp, key)
 		return
 	end
 	m.active = { wp = wp, key = key }
+	target.lastUsed = os.time()
 	wp_write_manifest(m)
 	M.active_session = target.id
 	M._usage = nil
@@ -2265,23 +2267,45 @@ function M.session_pick()
 	end)
 end
 
--- Switch to a session on `backend` within the active workpackage: reuse the most
--- recent one if present, else start a fresh session. Used when the picked model's
--- backend differs from the current session's (their ids can't cross-resume).
+-- Switch to `backend` (its ids can't cross-resume, so we can't keep the current
+-- session): load the LATEST session on that backend across ALL workpackages — restoring
+-- its workpackage + conversation. If none exists anywhere, land in the "default"
+-- workpackage with a fresh session on that backend.
 function M.switch_backend(backend)
 	local m = wp_manifest()
-	local sessions = m.packages[m.active.wp].sessions
-	local pick
-	for _, e in ipairs(sessions) do
-		if (e.backend or "opencode") == backend then
-			pick = e -- last match wins = most recent
+	local best, best_wp
+	for wpname, pkg in pairs(m.packages) do
+		for _, e in ipairs(pkg.sessions or {}) do
+			if (e.backend or "opencode") == backend then
+				if not best or (e.lastUsed or 0) > (best.lastUsed or 0) then
+					best, best_wp = e, wpname
+				end
+			end
 		end
 	end
-	if pick then
-		M.activate_session(m.active.wp, pick.key)
-	else
-		M.new_session() -- uses M.backend() = the just-selected model's backend
+	if best then
+		M.activate_session(best_wp, best.key) -- restores wp + session + transcript
+		return
 	end
+	-- nothing on this backend yet → default workpackage + a fresh session
+	if not m.packages["default"] then
+		m.packages["default"] = { sessions = {} }
+		vim.fn.mkdir(wp_dir("default"), "p")
+		pcall(M.ensure_journal, "default")
+	end
+	local sessions = m.packages["default"].sessions
+	local key = new_key()
+	sessions[#sessions + 1] =
+		{ key = key, name = "session " .. (#sessions + 1), id = nil, backend = backend, lastUsed = os.time() }
+	m.active = { wp = "default", key = key }
+	wp_write_manifest(m)
+	M.active_session = nil
+	M._usage = nil
+	if M._main and vim.api.nvim_buf_is_valid(M._main.conv_buf) then
+		M.render_transcript(M._main, nil) -- fresh session → empty transcript
+	end
+	M.rail_refresh()
+	vim.notify("Tandem → default ▸ new session  [" .. backend .. "]")
 end
 
 -- Rename the active session.
