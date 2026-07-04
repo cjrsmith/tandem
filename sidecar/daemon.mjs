@@ -345,7 +345,7 @@ async function listModels(tag) {
   }
   try {
     const b = await getClaude();
-    for (const m of b.listModels()) out.push(m);
+    for (const m of await b.listModels()) out.push(m);
   } catch (e) {
     debug("claude listModels failed", e);
   }

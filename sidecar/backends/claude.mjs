@@ -21,6 +21,10 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 
+function debug(...a) {
+  if (process.env.TANDEM_DEBUG) process.stderr.write("[claude] " + a.map(String).join(" ") + "\n");
+}
+
 // POST to the daemon's local bridge (same endpoints the OpenCode tools use). The
 // bridge port is published on the environment by daemon.mjs before we're loaded.
 async function bridge(pathname, body) {
@@ -127,14 +131,44 @@ function effortToThinking(effort) {
   }
 }
 
-// Claude models offered in the picker. All support reasoning (thinking). Uses the
-// user's Claude Code login (no API key) — the SDK spawns the claude binary.
-function listModels() {
-  return [
-    { backend: "claude", providerID: "anthropic", modelID: "claude-opus-4-8", label: "Claude · Opus 4.8", reasoning: true },
-    { backend: "claude", providerID: "anthropic", modelID: "claude-sonnet-4-6", label: "Claude · Sonnet 4.6", reasoning: true },
-    { backend: "claude", providerID: "anthropic", modelID: "claude-haiku-4-5-20251001", label: "Claude · Haiku 4.5", reasoning: true },
-  ];
+// Curated fallback if the live model list can't be fetched (offline / not logged in).
+const CURATED_MODELS = [
+  { backend: "claude", providerID: "anthropic", modelID: "claude-opus-4-8", label: "Claude · Opus 4.8", reasoning: true },
+  { backend: "claude", providerID: "anthropic", modelID: "claude-sonnet-4-6", label: "Claude · Sonnet 4.6", reasoning: true },
+  { backend: "claude", providerID: "anthropic", modelID: "claude-haiku-4-5-20251001", label: "Claude · Haiku 4.5", reasoning: true },
+];
+
+// List Claude models the user's login can actually use, via the SDK's supportedModels()
+// (a streaming-query control request). Uses the Claude Code login — no API key. Falls
+// back to CURATED_MODELS if the call fails or times out.
+async function listModels() {
+  const abort = new AbortController();
+  try {
+    const q = query({
+      prompt: (async function* () {})(), // empty streaming input → control requests available
+      options: { env: { ...process.env }, abortController: abort },
+    });
+    const models = await Promise.race([
+      q.supportedModels(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 6000)),
+    ]);
+    if (Array.isArray(models) && models.length) {
+      return models.map((m) => ({
+        backend: "claude",
+        providerID: "anthropic",
+        modelID: m.value,
+        label: "Claude · " + (m.displayName || m.value),
+        reasoning: true, // Claude models support thinking
+      }));
+    }
+  } catch (e) {
+    debug("claude supportedModels failed, using curated list", e);
+  } finally {
+    try {
+      abort.abort();
+    } catch {}
+  }
+  return CURATED_MODELS;
 }
 
 // A short "what the AI is doing now" label from a tool call (parallels toolLabel
