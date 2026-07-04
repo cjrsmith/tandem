@@ -124,38 +124,8 @@ function M.setup(opts)
 	pcall(M.wp_load) -- adopt the active workpackage's session on startup
 end
 
-function M.suggest(lines)
-	local row = vim.api.nvim_win_get_cursor(0)[1] - 1
-	local virt_lines = {}
-	for _, line in ipairs(lines) do
-		table.insert(virt_lines, { { line, "Comment" } })
-	end
-	vim.api.nvim_buf_set_extmark(0, ns, row, 0, { virt_lines = virt_lines })
-end
-
-function M.clear()
-	vim.api.nvim_buf_clear_namespace(0, ns, 0, -1)
-end
-
 M.last_suggestion = nil -- the chosen suggestion (code + where it belongs) to ghost/accept
 M.candidates = nil -- { blocks = {code,…}, buf, row } — Navigator's offered code blocks
-
--- Strip wrapping whitespace and an optional ```lang … ``` markdown fence.
-local function clean_code(s)
-	s = vim.trim(s)
-	s = s:gsub("^```%w*\n", ""):gsub("\n```$", "")
-	return vim.trim(s)
-end
-
--- Pull file-bound code out of a reply. Prefers the <tandem:suggest> tag (with an
--- optional file="…" attribute). As a safety net, a DRIVER that forgot the tag but
--- still fenced its code in ``` gets salvaged — so a momentary contract slip doesn't
--- silently drop the edit. Returns raw code (or nil) + the target file (or nil).
-function M.extract_suggestion(acc)
-	local file = acc:match('<tandem:suggest[^>]*file="([^"]*)"')
-	local code = acc:match("<tandem:suggest[^>]*>(.-)</tandem:suggest>")
-	return code, file
-end
 
 -- Every fenced ``` code block in a reply. Navigator suggestions live as ordinary
 -- markdown code blocks in prose (the model fences reliably in conversation), so
@@ -716,7 +686,7 @@ local function make_panel(box, title_label)
 end
 
 -- Stream one turn through a panel: echo the user's line, render the model's reply
--- (markdown, tandem tags stripped) into the transcript, then call on_done(acc).
+-- into the transcript, then call on_done(acc) if given.
 -- on_session(id) fires when the session id is learned; `fork` forks the session.
 local function panel_turn(P, session, user_text, prompt_text, on_session, on_done, fork, opts)
 	P.append_user(user_text)
@@ -744,13 +714,7 @@ local function panel_turn(P, session, user_text, prompt_text, on_session, on_don
 			end
 		elseif msg.type == "done" then
 			if r_start and vim.api.nvim_buf_is_valid(P.conv_buf) then
-				-- strip tandem tags but keep suggested code visible in the transcript
-				local display = vim.trim(acc
-					:gsub("<tandem:suggest[^>]*>(.-)</tandem:suggest>", "%1")
-					:gsub("<tandem:notify>.-</tandem:notify>", "")
-					:gsub("<tandem:ask>.-</tandem:ask>", "")
-					:gsub("<tandem:instruction>.-</tandem:instruction>", ""))
-				local lines = vim.split(vim.trim(display), "\n", { plain = true })
+				local lines = vim.split(vim.trim(acc), "\n", { plain = true })
 				lines[#lines + 1] = ""
 				vim.api.nvim_buf_set_lines(P.conv_buf, r_start, r_start + r_count, false, lines)
 				r_count = #lines
@@ -903,23 +867,15 @@ function M.chat_here(mode, scope, opts)
 		local text = (#parts == 1) and input or table.concat(parts, "\n\n")
 
 		panel_turn(P, source, input, text, set_session, function(acc)
-			M.handle_tags(acc, get_session())
-			local code, file = M.extract_suggestion(acc)
-			if M.role == "driver" then
-				if code then -- Driver normally writes via tandem_write; stray tag still types
-					M.last_suggestion = { code = clean_code(code), buf = origin.buf, row = origin.row, file = file }
-					M.accept_suggestion()
-				end
-			else
-				-- Navigator / Neutral: offer the reply's fenced code blocks as ghosts
+			-- Navigator / Neutral: offer the reply's fenced code blocks as ghosts.
+			-- (Driver writes via the tandem_write / tandem_region tools → on_edit, so
+			-- there's nothing to capture from the reply text here.)
+			if M.role ~= "driver" then
 				M.candidates = nil
 				local blocks = M.extract_blocks(acc)
 				if #blocks > 0 then
 					M.candidates = { blocks = blocks, buf = origin.buf, row = origin.row }
 					vim.notify(string.format("Tandem: %d code block%s — <leader>li to ghost", #blocks, #blocks > 1 and "s" or ""))
-				elseif code then -- legacy tag suggestion
-					M.last_suggestion = { code = clean_code(code), buf = origin.buf, row = origin.row, file = file }
-					vim.notify("Tandem: suggestion ready — <leader>li to ghost it")
 				end
 			end
 			-- this turn armed a region but the Driver never filled it (answered instead)
@@ -938,11 +894,7 @@ function M.chat_here(mode, scope, opts)
 				return
 			end
 			for _, m in ipairs(messages) do
-				local txt = vim.trim((m.text or "")
-					:gsub("<tandem:suggest[^>]*>(.-)</tandem:suggest>", "%1")
-					:gsub("<tandem:notify>.-</tandem:notify>", "")
-					:gsub("<tandem:ask>.-</tandem:ask>", "")
-					:gsub("<tandem:instruction>.-</tandem:instruction>", ""))
+				local txt = vim.trim(m.text or "")
 				if txt ~= "" then
 					if m.role == "user" then
 						P.append_user(txt)
@@ -1584,8 +1536,6 @@ function M.on_instruct(msg)
 		return
 	end
 	M.last_instruction = instr
-	M.todo_add("instruction", instr)
-	M.rail_refresh()
 
 	local W = math.floor(vim.o.columns * 0.7)
 	local H = math.min(16, vim.o.lines - 4)
@@ -1756,7 +1706,6 @@ function M.cancel_all()
 	end
 	M.activity_reset()
 	M.toast_dismiss()
-	M.pending_question = nil
 	vim.notify("Tandem: cancelled")
 end
 
@@ -2670,100 +2619,14 @@ function M.activity_stop()
 	end
 end
 
-M.pending_question = nil -- { question = ..., session = ... } while a question is open
-M.todos = {} -- running list of items the AI surfaced: { kind = ask|instruction|notify, text, done }
-
--- Record an item the AI flagged so it persists in the rail's TO-DO panel (not just
--- a transient toast). Capped to the most recent dozen.
-function M.todo_add(kind, text)
-	table.insert(M.todos, { kind = kind, text = vim.trim(text), done = false })
-	while #M.todos > 12 do
-		table.remove(M.todos, 1)
-	end
-end
-
--- Clear the TO-DO panel.
-function M.todos_clear()
-	M.todos = {}
-	M.rail_refresh()
-end
-
--- Surface the AI's process tags. Priority: question > instruction > narration.
--- Questions/instructions are sticky; narration auto-dismisses. Every tag also
--- lands in the rail's TO-DO panel so it persists after the toast fades.
-function M.handle_tags(acc, session)
-	local q = acc:match("<tandem:ask>(.-)</tandem:ask>")
-	local instr = acc:match("<tandem:instruction>(.-)</tandem:instruction>")
-	local notes = {}
-	for note in acc:gmatch("<tandem:notify>(.-)</tandem:notify>") do
-		notes[#notes + 1] = vim.trim(note)
-	end
-
-	-- persist all of them (the toast below only shows the single highest-priority one)
-	if q then
-		M.todo_add("ask", q)
-	end
-	if instr then
-		M.todo_add("instruction", instr)
-	end
-	for _, n in ipairs(notes) do
-		M.todo_add("notify", n)
-	end
-	if q or instr or #notes > 0 then
-		M.rail_refresh()
-	end
-
-	if q then
-		M.pending_question = { question = vim.trim(q), session = session }
-		M.toast("❓ " .. vim.trim(q) .. "\n\n<leader>lq to answer", { sticky = true, title = " tandem asks " })
-	elseif instr then
-		M.last_instruction = vim.trim(instr)
-		M.toast("▸ " .. vim.trim(instr) .. "\n\n<leader>lx to dismiss", { sticky = true, title = " instruction " })
-	elseif #notes > 0 then
-		M.toast(table.concat(notes, "\n")) -- transient narration
-	end
-end
-
-
--- Send `text` to a session and surface the reply (toasts; Driver code typed at cursor).
+-- Send `text` to a session. Questions / narration / edits all arrive out-of-band via
+-- the tandem_* tools (→ on_ask / on_notify / on_edit), so there's nothing to parse
+-- from the reply text here.
 function M.run(session, text)
-	local acc = ""
 	M.prompt(session, text, function(msg)
 		if msg.type == "session" then
 			M.set_active_session(msg.id)
-			session = msg.id
-		elseif msg.type == "delta" then
-			acc = acc .. msg.text
-		elseif msg.type == "done" then
-			-- Driver edits now arrive via the tandem_write tool (→ M.on_edit), so there's
-			-- no suggestion to apply here; just surface notify/ask/instruction.
-			M.handle_tags(acc, session)
 		end
-	end)
-end
-
--- Answer the pending question; feeds it back into the session and continues.
-function M.answer()
-	local pq = M.pending_question
-	if not pq then
-		vim.notify("Tandem: no pending question")
-		return
-	end
-	vim.ui.input({ prompt = pq.question .. " " }, function(ans)
-		if not ans or ans == "" then
-			return
-		end
-		M.pending_question = nil
-		M.toast_dismiss()
-		-- tick off the most recent open question in the TO-DO panel
-		for i = #M.todos, 1, -1 do
-			if M.todos[i].kind == "ask" and not M.todos[i].done then
-				M.todos[i].done = true
-				break
-			end
-		end
-		M.rail_refresh()
-		M.run(pq.session, ans)
 	end)
 end
 
@@ -2919,12 +2782,12 @@ end
 -- ── Attribute rail (read-only labels in the command centre's right pane) ──
 -- A pure display of current state. You never edit IN here — editing happens
 -- through the selectors (settings_menu / the per-setting keybinds), so the rail
--- can never drift out of sync. Top half = settings; bottom = a to-do/notif slot.
--- Render the attribute rail. `todo` (default true) controls the TO-DO panel — the
--- command centre shows it; bubbles want settings only.
-function M.render_rail(buf, todo)
-	if todo == nil then
-		todo = true
+-- can never drift out of sync. Top half = settings; bottom = the backlog panel.
+-- Render the attribute rail. `show_backlog` (default true) controls the backlog
+-- panel — the command centre shows it; bubbles want settings only.
+function M.render_rail(buf, show_backlog)
+	if show_backlog == nil then
+		show_backlog = true
 	end
 	if not vim.api.nvim_buf_is_valid(buf) then
 		return
@@ -2968,7 +2831,7 @@ function M.render_rail(buf, todo)
 		lines[#lines + 1] = "  Context  " .. ctx_s
 		lines[#lines + 1] = "  Cost     $" .. string.format("%.4f", u.cost or 0)
 	end
-	if todo then -- the command centre shows the workpackage backlog (top few)
+	if show_backlog then -- the command centre shows the workpackage backlog (top few)
 		lines[#lines + 1] = ""
 		lines[#lines + 1] = "  ──────────────"
 		lines[#lines + 1] = ""
@@ -3033,11 +2896,7 @@ function M.render_transcript(P, session)
 			return
 		end
 		for _, m in ipairs(messages) do
-			local txt = vim.trim((m.text or "")
-				:gsub("<tandem:suggest[^>]*>(.-)</tandem:suggest>", "%1")
-				:gsub("<tandem:notify>.-</tandem:notify>", "")
-				:gsub("<tandem:ask>.-</tandem:ask>", "")
-				:gsub("<tandem:instruction>.-</tandem:instruction>", ""))
+			local txt = vim.trim(m.text or "")
 			if txt ~= "" then
 				if m.role == "user" then
 					P.append_user(txt)
@@ -3079,8 +2938,6 @@ function M.open_chat()
 		panel_turn(P, M.active_session, input, text, function(id)
 			M.set_active_session(id)
 			M.rail_refresh()
-		end, function(acc)
-			M.handle_tags(acc, M.active_session)
 		end)
 	end)
 
