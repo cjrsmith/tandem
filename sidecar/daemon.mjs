@@ -22,7 +22,7 @@ import os from "node:os";
 import path from "node:path";
 
 const MODEL = { providerID: "opencode", modelID: "north-mini-code-free" };
-const VERSION = "2026-07-04 models+effort";
+const VERSION = "2026-07-04 tool-events";
 
 // tandem_instruct: the Navigator gives the human ONE directive (a next step). Sticky,
 // non-blocking — shown in the notification bar until dismissed / next asked.
@@ -379,7 +379,22 @@ process.on("SIGINT", () => shutdown(0));
 // streaming from it.
 const active = new Map(); // sessionID -> { tag }
 const partType = new Map(); // partID -> "text" | "reasoning" | ... (to filter reasoning)
+const toolPhase = new Map(); // callID -> last tool phase emitted ("running"|"done")
 let lastStatus = ""; // dedupe the one-line status we push to the editor
+
+// Trim a tool's output for display (bash etc. can be huge). Keeps the head.
+function trimOutput(s, maxLines = 12, maxChars = 1000) {
+  if (!s) return "";
+  let lines = String(s).split("\n");
+  let cut = lines.length > maxLines;
+  lines = lines.slice(0, maxLines);
+  let out = lines.join("\n");
+  if (out.length > maxChars) {
+    out = out.slice(0, maxChars);
+    cut = true;
+  }
+  return cut ? out + "\n…" : out;
+}
 
 // A concise "what the AI is doing now" label from a tool call (falls back when
 // OpenCode doesn't supply its own title).
@@ -425,8 +440,26 @@ const events = await client.event.subscribe();
       // Surface what the AI is doing as a one-line status (global; the editor shows
       // it in the activity indicator). Deduped so we don't spam identical lines.
       let label = null;
-      if (part.type === "tool" && part.state && (part.state.status === "running" || part.state.status === "pending")) {
-        label = part.state.title || toolLabel(part.tool, part.state.input);
+      if (part.type === "tool" && part.state) {
+        const st = part.state.status;
+        const title = part.state.title || toolLabel(part.tool, part.state.input);
+        const key = part.callID || part.id;
+        // Full tool-call events (name + title + output) for the activity bar and the
+        // command-centre transcript — beyond the one-line status. Emit start once,
+        // then done/error once.
+        if (st === "running" || st === "pending") {
+          label = title;
+          if (toolPhase.get(key) !== "running") {
+            toolPhase.set(key, "running");
+            send({ type: "tool", phase: "running", tool: part.tool, title, session: part.sessionID });
+          }
+        } else if (st === "completed" && toolPhase.get(key) !== "done") {
+          toolPhase.set(key, "done");
+          send({ type: "tool", phase: "done", tool: part.tool, title, output: trimOutput(part.state.output), session: part.sessionID });
+        } else if (st === "error" && toolPhase.get(key) !== "done") {
+          toolPhase.set(key, "done");
+          send({ type: "tool", phase: "error", tool: part.tool, title, error: String(part.state.error || "error"), session: part.sessionID });
+        }
       } else if (part.type === "reasoning") {
         label = "thinking…";
       }
@@ -441,6 +474,7 @@ const events = await client.event.subscribe();
       }
     } else if (event.type === "session.idle") {
       lastStatus = ""; // reset so the next turn re-emits its status
+      toolPhase.clear();
       send({ tag: req.tag, type: "done" });
       active.delete(p.sessionID);
     } else if (event.type === "session.error") {

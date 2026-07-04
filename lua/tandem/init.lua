@@ -213,6 +213,7 @@ function M.setup_keymaps(prefix)
 	map("n", p("<Space>"), M.settings_menu, "settings menu")
 	map("n", p("Q"), M.close_surfaces, "close all chat surfaces")
 	map("n", p("q"), M.toast_dismiss, "dismiss toast")
+	map("n", p("o"), M.toggle_toollog, "toggle tool activity bar")
 	map({ "n", "i" }, "<C-Space>", M.toggle_focus, "toggle focus")
 end
 
@@ -1162,6 +1163,8 @@ local function on_stdout(_, data)
 					M.on_permission(msg) -- a side-effecting tool wants to run — ask first
 				elseif msg.type == "status" then
 					M.on_status(msg) -- one-line "what the AI is doing now"
+				elseif msg.type == "tool" then
+					M.on_tool(msg) -- a tool call (running/done/error) → activity bar
 				elseif daemon.handlers[msg.tag] then
 					daemon.handlers[msg.tag](msg)
 				end
@@ -2716,6 +2719,99 @@ function M.toast(text, opts)
 		end, opts.timeout or 4500)
 	end
 	return win
+end
+
+-- ── Tool activity bar (bottom: what tools run + their output, live) ──
+-- A read-only, toggleable bar at the bottom showing the tool calls streaming through
+-- the current session (name + output) — like watching Claude Code / OpenCode work.
+-- Fed by daemon `tool` events (running / done / error). Off by default; toggle to show.
+M._toollog = M._toollog or { lines = {}, win = nil, buf = nil, on = false }
+
+local function toollog_close()
+	if M._toollog.win and vim.api.nvim_win_is_valid(M._toollog.win) then
+		pcall(vim.api.nvim_win_close, M._toollog.win, true)
+	end
+	M._toollog.win = nil
+end
+
+local function toollog_render()
+	local log = M._toollog
+	if not log.on then
+		return toollog_close()
+	end
+	local n = #log.lines
+	local height = math.max(1, math.min(10, n))
+	local tail = {}
+	for i = math.max(1, n - height + 1), n do
+		tail[#tail + 1] = log.lines[i]
+	end
+	if #tail == 0 then
+		tail = { "⚙  (no activity yet)" }
+	end
+	local width = math.min(vim.o.columns - 2, 110)
+	if log.win and vim.api.nvim_win_is_valid(log.win) then
+		vim.api.nvim_buf_set_lines(log.buf, 0, -1, false, tail)
+		vim.api.nvim_win_set_config(log.win, {
+			relative = "editor", anchor = "SW", row = vim.o.lines - 2, col = 1, width = width, height = #tail,
+		})
+	else
+		local b = vim.api.nvim_create_buf(false, true)
+		vim.bo[b].bufhidden = "wipe"
+		vim.api.nvim_buf_set_lines(b, 0, -1, false, tail)
+		log.buf = b
+		log.win = vim.api.nvim_open_win(b, false, {
+			relative = "editor", anchor = "SW", row = vim.o.lines - 2, col = 1,
+			width = width, height = #tail, style = "minimal", border = "rounded",
+			focusable = false, noautocmd = true, title = " ⚙ activity ", title_pos = "left",
+		})
+		vim.wo[log.win].winhighlight = "FloatBorder:TandemBorderDim"
+	end
+	pcall(vim.api.nvim_win_set_cursor, log.win, { #tail, 0 }) -- keep the tail in view
+end
+
+-- One tool event → log line(s).
+local function tool_log_lines(msg)
+	if msg.phase == "running" then
+		return { "⚙  " .. (msg.title or msg.tool or "tool") }
+	elseif msg.phase == "error" then
+		return { "   ✗ " .. (msg.error or "error") }
+	else -- done
+		if msg.output and vim.trim(msg.output) ~= "" then
+			local out = {}
+			for _, l in ipairs(vim.split(msg.output, "\n", { plain = true })) do
+				out[#out + 1] = "   │ " .. l
+			end
+			return out
+		end
+		return { "   ✓" }
+	end
+end
+
+-- A tool call happened (running/done/error). Append to the activity log (+ later the
+-- main transcript). Routed from on_stdout.
+function M.on_tool(msg)
+	local log = M._toollog
+	for _, l in ipairs(tool_log_lines(msg)) do
+		log.lines[#log.lines + 1] = l
+	end
+	while #log.lines > 300 do
+		table.remove(log.lines, 1)
+	end
+	if log.on then
+		toollog_render()
+	end
+end
+
+-- Toggle the bottom tool-activity bar.
+function M.toggle_toollog()
+	M._toollog.on = not M._toollog.on
+	if M._toollog.on then
+		toollog_render()
+		vim.notify("Tandem: activity bar on")
+	else
+		toollog_close()
+		vim.notify("Tandem: activity bar off")
+	end
 end
 
 -- ── Activity indicator (spinner while the AI is working) ─────────
