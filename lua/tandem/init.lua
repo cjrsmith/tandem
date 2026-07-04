@@ -119,6 +119,11 @@ end
 -- (M.new_session lives with the workpackage/session code below — it adds a fresh
 -- session to the ACTIVE workpackage.)
 
+-- The keymap prefix the default set uses (setup() overrides from opts.prefix). Toast /
+-- notification hints derive their key suggestions from this, so they stay correct if the
+-- prefix is changed. (If you set keys=false and bind your own, hints show this default.)
+M.prefix = "<leader>t"
+
 -- Default keymaps. Only the IN-FLOW actions get a direct key; everything else (mode,
 -- level, coach, follow, pace, session/workpackage rename, compact, jot note, plan,
 -- restart daemon…) lives behind the settings menu at <prefix><Space>. Disable with
@@ -175,9 +180,12 @@ end
 
 function M.setup(opts)
 	M.opts = opts or {}
+	if M.opts.prefix then
+		M.prefix = M.opts.prefix -- so hint text matches the chosen prefix
+	end
 	pcall(M.wp_load) -- adopt the active workpackage's session on startup
 	if M.opts.keys ~= false then -- setup({ keys = false }) to bind your own
-		pcall(M.setup_keymaps, M.opts.prefix)
+		pcall(M.setup_keymaps, M.prefix)
 	end
 end
 
@@ -199,7 +207,7 @@ function M.extract_blocks(text)
 end
 
 -- Paint `code` as greyed ghost text below `row` in `buf`, and remember it as the
--- chosen suggestion (so <leader>la can type it in).
+-- chosen suggestion (so <leader>ta accepts it).
 local function render_ghost(code, buf, row)
 	if not vim.api.nvim_buf_is_valid(buf) then
 		return
@@ -932,7 +940,7 @@ function M.chat_here(mode, scope, opts)
 				local blocks = M.extract_blocks(acc)
 				if #blocks > 0 then
 					M.candidates = { blocks = blocks, buf = origin.buf, row = origin.row }
-					vim.notify(string.format("Tandem: %d code block%s — <leader>li to ghost", #blocks, #blocks > 1 and "s" or ""))
+					vim.notify(string.format("Tandem: %d code block%s — %si to ghost", #blocks, #blocks > 1 and "s" or "", M.prefix))
 				end
 			end
 			-- this turn armed a region but the Driver never filled it (answered instead)
@@ -1294,7 +1302,7 @@ end
 -- The agent's tandem_write tool (via the daemon bridge) wants to write a file. We
 -- own application: type the content into the buffer with the watchable typewriter,
 -- persist it, then ack so the blocked tool returns and the agent continues.
--- We do NOT steal focus (Follow-off behaviour) — <leader>lg jumps you to it.
+-- We do NOT steal focus (Follow-off behaviour) — <leader>tg jumps you to it.
 function M.on_edit(msg)
 	-- An edit is already in flight → wait our turn (serialized; see M._edit_queue).
 	if defer_if_busy("edit", msg) then
@@ -1373,7 +1381,7 @@ function M._do_edit(msg)
 		M.show_buf(buf, a_lo + 1)
 		M.toast("✎ following: " .. name)
 	else
-		M.toast("✎ editing " .. name .. " — <leader>lg to follow")
+		M.toast("✎ editing " .. name .. " — " .. M.prefix .. "g to follow")
 	end
 
 	if b_hi <= b_lo then -- pure deletion: drop the lines, nothing to type
@@ -1448,7 +1456,7 @@ function M._do_region(msg)
 		M.show_buf(r.buf, tr + 1)
 		M.toast("✎ implementing region")
 	else
-		M.toast("✎ implementing region — <leader>lg to follow")
+		M.toast("✎ implementing region — " .. M.prefix .. "g to follow")
 	end
 	local intervals = { char = 38, word = 75, line = 120, paragraph = 250 }
 	local gran = M.granularity
@@ -1664,7 +1672,7 @@ function M.interrupt_edit()
 		if tr then
 			pcall(vim.api.nvim_buf_set_extmark, e.buf, edit_ns, tr, tc, {
 				id = ae.top, right_gravity = false, virt_lines_above = true,
-				virt_lines = { { { "⟨ paused — <leader>lc to continue ⟩", "TandemImplementing" } } },
+				virt_lines = { { { "⟨ paused — " .. M.prefix .. "r to continue ⟩", "TandemImplementing" } } },
 			})
 		end
 		local br, bc = mark_pos(e.buf, ae.bot)
@@ -1687,7 +1695,7 @@ function M.interrupt_edit()
 		id = e.id,
 		message = "The user pressed PAUSE to take over for a moment. Stop writing — do NOT call tandem_write again now. Reply with one short sentence acknowledging, then wait for their next message.",
 	})
-	M.toast("⏸ paused — chat / edit freely; <leader>lc when you want it to continue", { sticky = true })
+	M.toast("⏸ paused — chat / edit freely; " .. M.prefix .. "r when you want it to continue", { sticky = true })
 end
 
 -- CONTINUE: hand control back. Resume the paused work with everything that happened
@@ -2312,7 +2320,7 @@ function M.on_journal(msg)
 		return
 	end
 	write_doc(M.wp_journal_path(), vim.split(content, "\n", { plain = true }))
-	M.toast("✎ journal updated — <leader>lj to view")
+	M.toast("✎ journal updated — " .. M.prefix .. "j to view")
 end
 
 -- Mark backlog items done by matching their text (used by tandem_backlog complete).
@@ -2771,7 +2779,7 @@ end
 
 -- Follow: when ON, the AI's edits open and jump you to the file so you watch it
 -- type live (the chat is closed if it's covering your code). When OFF, edits type
--- off-screen and a toast offers <leader>lg to follow manually.
+-- off-screen and a toast offers <leader>tg to follow manually.
 function M.toggle_follow()
 	M.follow = not M.follow
 	vim.notify("Tandem follow → " .. (M.follow and "on" or "off"))
@@ -2912,7 +2920,7 @@ function M.render_rail(buf, show_backlog)
 		lines[#lines + 1] = "  🗒  BACKLOG" .. (open > 0 and ("  (" .. open .. ")") or "")
 		lines[#lines + 1] = ""
 		if #items == 0 then
-			lines[#lines + 1] = "  (empty — <leader>lb)"
+			lines[#lines + 1] = "  (empty — " .. M.prefix .. "b)"
 		else
 			local shown = 0
 			for _, it in ipairs(items) do -- priority order = file order
