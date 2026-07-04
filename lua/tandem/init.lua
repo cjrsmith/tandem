@@ -119,9 +119,66 @@ end
 -- (M.new_session lives with the workpackage/session code below — it adds a fresh
 -- session to the ACTIVE workpackage.)
 
+-- Default keymaps. Only the IN-FLOW actions get a direct key; everything else (mode,
+-- level, coach, follow, pace, session/workpackage rename, compact, jot note, plan,
+-- restart daemon…) lives behind the settings menu at <prefix><Space>. Disable with
+-- setup({ keys = false }); rebind the whole set with setup({ prefix = "<leader>a" }).
+function M.setup_keymaps(prefix)
+	prefix = prefix or "<leader>t"
+	local function map(mode, lhs, rhs, desc)
+		vim.keymap.set(mode, lhs, rhs, { desc = "Tandem: " .. desc, silent = true })
+	end
+	local function p(k)
+		return prefix .. k
+	end
+	-- chat surfaces
+	map("n", p("t"), M.open_chat, "main chat (command centre)")
+	map("n", p("c"), function() M.chat_here() end, "chat bubble here")
+	map("n", p("e"), function() M.chat_here("ephemeral") end, "ephemeral bubble")
+	map("n", p("k"), function() M.chat_here("fork") end, "fork bubble")
+	map("n", p("f"), function() M.chat_here("working", "file") end, "chat about whole file")
+	map("n", p("p"), M.reopen_chat, "reopen previous bubble")
+	map("x", p("c"), function() M.chat_here("working", "selection") end, "chat about selection")
+	map("x", p("e"), function() M.chat_here("ephemeral", "selection") end, "ephemeral (selection)")
+	map("x", p("k"), function() M.chat_here("fork", "selection") end, "fork (selection)")
+	-- suggestions (Navigator ghosts)
+	map("n", p("i"), M.ghost_suggestion, "ghost the suggestion")
+	map("n", p("a"), M.accept_suggestion, "accept suggestion")
+	map("n", p("d"), M.clear_suggestion, "dismiss ghost")
+	-- Driver edit flow
+	map("n", p("g"), M.jump_to_edit, "jump to the AI's edit")
+	map("n", p("w"), M.confirm_write, "confirm Follow write")
+	map("n", p("x"), M.interrupt_edit, "interrupt the turn (take over)")
+	map("n", p("r"), M.continue_work, "continue the turn")
+	map("n", p("="), M.pause, "pause typing")
+	map("n", p("-"), M.resume, "resume typing")
+	map("n", p("G"), M.clear_edit, "clear edit highlight")
+	map("n", p("/"), M.cancel_all, "cancel everything")
+	-- review the AI's uncommitted changes
+	map("n", p("v"), M.review, "review changes")
+	map("n", p("V"), M.review_exit, "exit review")
+	map("n", p("S"), M.review_summaries, "summarise changes")
+	-- context (frequent)
+	map("n", p("s"), M.session_pick, "switch session")
+	map("n", p("n"), M.new_session, "new session")
+	map("n", p("j"), M.view_journal, "view journal")
+	map("n", p("b"), M.backlog, "open backlog")
+	map("n", p("m"), M.pick_model, "pick model")
+	map("n", p("P"), M.capture_plan, "capture plan → journal + backlog")
+	map("n", p("]"), M.next_instruction, "next instruction (Navigator)")
+	-- surfaces / hub
+	map("n", p("<Space>"), M.settings_menu, "settings menu")
+	map("n", p("Q"), M.close_surfaces, "close all chat surfaces")
+	map("n", p("q"), M.toast_dismiss, "dismiss toast")
+	map({ "n", "i" }, "<C-Space>", M.toggle_focus, "toggle focus")
+end
+
 function M.setup(opts)
 	M.opts = opts or {}
 	pcall(M.wp_load) -- adopt the active workpackage's session on startup
+	if M.opts.keys ~= false then -- setup({ keys = false }) to bind your own
+		pcall(M.setup_keymaps, M.opts.prefix)
+	end
 end
 
 M.last_suggestion = nil -- the chosen suggestion (code + where it belongs) to ghost/accept
@@ -2762,9 +2819,11 @@ function M.settings_menu()
 		{ label = "New workpackage", run = M.wp_new },
 		{ label = "Rename workpackage", run = M.wp_rename },
 		{ label = "View journal", run = M.view_journal },
+		{ label = "Jot journal note", run = M.journal_note },
 		{ label = "Capture plan → journal + backlog (AI)", run = M.capture_plan },
 		{ label = "Open backlog", run = M.backlog },
 		{ label = "Plan backlog (AI)", run = M.plan },
+		{ label = "Restart daemon", run = M.restart_daemon },
 	}
 	vim.ui.select(items, {
 		prompt = "Tandem settings:",
