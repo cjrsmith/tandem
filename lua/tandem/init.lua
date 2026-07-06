@@ -15,6 +15,7 @@ vim.api.nvim_set_hl(0, "TandemImplementing", { link = "Comment", default = true 
 local IMPL_LABEL = "⟨ implementing… ⟩" -- the marker shown above & below the AI's region
 
 local chat_ns = vim.api.nvim_create_namespace("tandem_chat") -- user-message backgrounds
+local status_ns = vim.api.nvim_create_namespace("tandem_status") -- live "AI is working" footer in a chat
 -- Subtle grey block behind YOUR messages in chat (like opencode/claude); overridable.
 vim.api.nvim_set_hl(0, "TandemUserMsg", { bg = "#2b2b33", default = true })
 
@@ -63,6 +64,7 @@ end
 
 M.active_session = nil -- the current working session, shared across bubbles
 M.active_edit = nil -- { buf, srow, erow } — where the AI is currently writing code
+M._status_panels = setmetatable({}, { __mode = "k" }) -- chat panels showing a live status footer
 
 -- Models for the picker. This is a FALLBACK; M.fetch_models replaces it with the models
 -- actually available through the backends (OpenCode providers + Claude). Each entry:
@@ -796,6 +798,29 @@ local function make_panel(box, title_label)
 		end
 	end
 
+	-- Live "AI is working" footer: a virtual line below the transcript (doesn't consume a
+	-- real line, so it never fights the stream). Animated by the activity timer; cleared
+	-- when the turn ends.
+	function P.set_status(text)
+		if not vim.api.nvim_buf_is_valid(conv_buf) then
+			return
+		end
+		local last = math.max(0, vim.api.nvim_buf_line_count(conv_buf) - 1)
+		P._status_id = vim.api.nvim_buf_set_extmark(conv_buf, status_ns, last, 0, {
+			id = P._status_id,
+			virt_lines = { { { text, "TandemRailLabel" } } },
+		})
+		if vim.api.nvim_win_is_valid(conv_win) and vim.api.nvim_get_current_win() ~= conv_win then
+			pcall(vim.api.nvim_win_set_cursor, conv_win, { vim.api.nvim_buf_line_count(conv_buf), 0 })
+		end
+	end
+	function P.clear_status()
+		if vim.api.nvim_buf_is_valid(conv_buf) then
+			pcall(vim.api.nvim_buf_clear_namespace, conv_buf, status_ns, 0, -1)
+		end
+		P._status_id = nil
+	end
+
 	-- append YOUR message as a grey-highlighted block (no "you ▸" prefix).
 	function P.append_user(text)
 		local lines = vim.split(text, "\n", { plain = true })
@@ -839,6 +864,8 @@ local function panel_turn(P, session, user_text, prompt_text, on_session, on_don
 	P.append_user(user_text)
 	prompt_text = M.resolve_refs(prompt_text) -- pull in any @file references
 	P.commit_stream() -- clean slate
+	M._status_panels[P] = true -- show the live "AI is working" footer in this chat
+	P.set_status("⠋ waiting…")
 	local acc = ""
 	M.prompt(session, prompt_text, function(msg)
 		if msg.type == "session" then
@@ -848,10 +875,14 @@ local function panel_turn(P, session, user_text, prompt_text, on_session, on_don
 		elseif msg.type == "delta" then
 			acc = acc .. msg.text
 			P.stream_delta(msg.text) -- rewrites the growing reply block (tool blocks can interleave)
-		elseif msg.type == "done" then
-			P.commit_stream()
-			if on_done then
-				on_done(acc)
+		elseif msg.type == "done" or msg.type == "error" then
+			M._status_panels[P] = nil
+			P.clear_status()
+			if msg.type == "done" then
+				P.commit_stream()
+				if on_done then
+					on_done(acc)
+				end
 			end
 		end
 	end, fork, opts)
@@ -2889,12 +2920,28 @@ local function activity_render()
 	end
 end
 
+-- Repaint the live status footer inside every open chat that's awaiting a turn (same
+-- spinner + label as the top-right indicator), so you see what's happening in the
+-- conversation window too. Re-places the footer at the current last line each tick.
+local function repaint_panel_status()
+	if not next(M._status_panels) then
+		return
+	end
+	local text = SPINNER[activity.frame] .. "  " .. (activity.label or "working…")
+	for P in pairs(M._status_panels) do
+		if P.set_status then
+			P.set_status(text)
+		end
+	end
+end
+
 -- Update the one-line status the AI pushes (thinking / reading X / writing Y / …).
 function M.on_status(msg)
 	activity.label = msg.label
 	if activity.win and vim.api.nvim_win_is_valid(activity.win) then
 		activity_render() -- only repaint if the indicator is up
 	end
+	repaint_panel_status()
 end
 
 function M.activity_reset()
@@ -2908,6 +2955,12 @@ function M.activity_reset()
 	end
 	activity.win = nil
 	activity.label = nil
+	for P in pairs(M._status_panels) do -- clear any lingering chat footers (cancel/error)
+		if P.clear_status then
+			pcall(P.clear_status)
+		end
+		M._status_panels[P] = nil
+	end
 end
 
 function M.activity_start()
@@ -2916,9 +2969,11 @@ function M.activity_start()
 		activity.frame = 1
 		activity.label = "thinking…" -- until the first status event arrives
 		activity_render()
+		repaint_panel_status()
 		activity.timer = vim.fn.timer_start(110, function()
 			activity.frame = (activity.frame % #SPINNER) + 1
 			activity_render()
+			repaint_panel_status()
 		end, { ["repeat"] = -1 })
 	end
 end
