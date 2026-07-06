@@ -7,3 +7,6 @@ node_modules/
 # per-project runtime state (workpackage manifest, journals, backlog, sessions)
 .tandem/
 
+
+# OpenCode writes its project config here when effort/permissions change
+config.json
