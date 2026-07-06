@@ -12,7 +12,14 @@ local region_ns = vim.api.nvim_create_namespace("tandem_region")
 -- Subtle blue/grey wash over the region the AI is writing.
 vim.api.nvim_set_hl(0, "TandemActiveEdit", { bg = "#2d3446" })
 vim.api.nvim_set_hl(0, "TandemImplementing", { link = "Comment", default = true })
-local IMPL_LABEL = "⟨ implementing… ⟩" -- the marker shown above & below the AI's region
+-- Shared loading spinner (also used by the activity indicator + chat status footers).
+-- The "Implementing…" marker bracketing the region the AI types into animates with it,
+-- driven by the activity timer.
+local SPINNER = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
+local spin = 1 -- current spinner frame
+local function impl_label()
+	return SPINNER[spin] .. "  Implementing…"
+end
 
 local chat_ns = vim.api.nvim_create_namespace("tandem_chat") -- user-message backgrounds
 local status_ns = vim.api.nvim_create_namespace("tandem_status") -- live "AI is working" footer in a chat
@@ -365,7 +372,7 @@ local function mark_refresh()
 		id = stream.top_mark,
 		right_gravity = false,
 		virt_lines_above = true,
-		virt_lines = { { { IMPL_LABEL, "TandemImplementing" } } },
+		virt_lines = { { { impl_label(), "TandemImplementing" } } },
 		end_row = br,
 		end_col = 0,
 		hl_group = "TandemActiveEdit",
@@ -467,11 +474,11 @@ function M.type_out(text, opts)
 	stream.top_mark = vim.api.nvim_buf_set_extmark(stream.buf, edit_ns, row, col, {
 		right_gravity = false,
 		virt_lines_above = true,
-		virt_lines = { { { IMPL_LABEL, "TandemImplementing" } } },
+		virt_lines = { { { impl_label(), "TandemImplementing" } } },
 	})
 	stream.bot_mark = vim.api.nvim_buf_set_extmark(stream.buf, edit_ns, row, col, {
 		right_gravity = true,
-		virt_lines = { { { IMPL_LABEL, "TandemImplementing" } } },
+		virt_lines = { { { impl_label(), "TandemImplementing" } } },
 	})
 	M.active_edit = { buf = stream.buf, top = stream.top_mark, bot = stream.bot_mark, srow = row, erow = row }
 	start_timer()
@@ -998,7 +1005,7 @@ function M.chat_here(mode, scope, opts)
 			-- the Driver fills each via tandem_region, in order.
 			if M.role == "driver" then
 				local b = origin.buf
-				local label = { { { IMPL_LABEL, "TandemImplementing" } } }
+				local label = { { { impl_label(), "TandemImplementing" } } }
 				if sel_range then
 					-- SELECTION → replace it (shown marked, since you clearly want an edit)
 					local last = vim.api.nvim_buf_get_lines(b, sel_range.erow, sel_range.erow + 1, false)[1] or ""
@@ -2890,11 +2897,39 @@ function M.toggle_toollog()
 end
 
 -- ── Activity indicator (spinner while the AI is working) ─────────
-local activity = { n = 0, win = nil, timer = nil, frame = 1, label = nil }
-local SPINNER = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
+-- SPINNER + `spin` (the shared frame) are defined at the top, so the "Implementing…"
+-- region markers animate in lock-step with this indicator and the chat footers.
+local activity = { n = 0, win = nil, timer = nil, label = nil }
+
+-- Re-render the AI's edit-region markers with the current spinner frame (animates the
+-- "Implementing…" brackets). No-op when nothing is being typed.
+local function refresh_impl_markers()
+	local e = M.active_edit
+	if M._held or not (e and e.buf and vim.api.nvim_buf_is_valid(e.buf) and e.top) then
+		return -- M._held → paused (its markers say "paused"); don't overwrite
+	end
+	local tr, tc = mark_pos_ns(e.buf, edit_ns, e.top)
+	local br = e.bot and mark_pos_ns(e.buf, edit_ns, e.bot)
+	if not tr then
+		return
+	end
+	local label = { { { impl_label(), "TandemImplementing" } } }
+	pcall(vim.api.nvim_buf_set_extmark, e.buf, edit_ns, tr, tc, {
+		id = e.top, right_gravity = false, virt_lines_above = true, virt_lines = label,
+		end_row = br, end_col = br and 0 or nil, hl_group = br and "TandemActiveEdit" or nil, hl_eol = br and true or nil,
+	})
+	if br then
+		local brr, brc = mark_pos_ns(e.buf, edit_ns, e.bot)
+		if brr then
+			pcall(vim.api.nvim_buf_set_extmark, e.buf, edit_ns, brr, brc, {
+				id = e.bot, right_gravity = true, virt_lines = label,
+			})
+		end
+	end
+end
 
 local function activity_render()
-	local text = SPINNER[activity.frame] .. " " .. (activity.label or "tandem working…")
+	local text = SPINNER[spin] .. " " .. (activity.label or "tandem working…")
 	local width = math.min(vim.fn.strdisplaywidth(text), vim.o.columns - 2)
 	if activity.win and vim.api.nvim_win_is_valid(activity.win) then
 		vim.api.nvim_buf_set_lines(vim.api.nvim_win_get_buf(activity.win), 0, -1, false, { text })
@@ -2927,7 +2962,7 @@ local function repaint_panel_status()
 	if not next(M._status_panels) then
 		return
 	end
-	local text = SPINNER[activity.frame] .. "  " .. (activity.label or "working…")
+	local text = SPINNER[spin] .. "  " .. (activity.label or "working…")
 	for P in pairs(M._status_panels) do
 		if P.set_status then
 			P.set_status(text)
@@ -2966,14 +3001,15 @@ end
 function M.activity_start()
 	activity.n = activity.n + 1
 	if not activity.timer then
-		activity.frame = 1
+		spin = 1
 		activity.label = "thinking…" -- until the first status event arrives
 		activity_render()
 		repaint_panel_status()
 		activity.timer = vim.fn.timer_start(110, function()
-			activity.frame = (activity.frame % #SPINNER) + 1
+			spin = (spin % #SPINNER) + 1
 			activity_render()
 			repaint_panel_status()
+			refresh_impl_markers()
 		end, { ["repeat"] = -1 })
 	end
 end
