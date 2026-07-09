@@ -2891,21 +2891,26 @@ end
 
 -- One tool event → log line(s).
 local function tool_log_lines(msg)
-	if msg.phase == "running" then
-		-- a bash title can be a whole multi-line heredoc — collapse it to one line
-		return { "⚙  " .. one_line(msg.title or msg.tool or "tool") }
-	elseif msg.phase == "error" then
-		return { "   ✗ " .. one_line(msg.error or "error") }
-	else -- done
-		if msg.output and vim.trim(msg.output) ~= "" then
-			local out = {}
-			for _, l in ipairs(vim.split(msg.output, "\n", { plain = true })) do
-				out[#out + 1] = "   │ " .. l
-			end
-			return out
-		end
-		return { "   ✓" }
+	-- a bash title can be a whole multi-line heredoc — collapse it to one line.
+	-- `header` = the daemon never emitted a "running" line for this call (it finished
+	-- before its input streamed in), so this block must carry the ⚙ header itself.
+	local out = {}
+	if msg.phase == "running" or msg.header then
+		out[#out + 1] = "⚙  " .. one_line(msg.title or msg.tool or "tool")
 	end
+	if msg.phase == "running" then
+		return out
+	end
+	if msg.phase == "error" then
+		out[#out + 1] = "   ✗ " .. one_line(msg.error or "error")
+	elseif msg.output and vim.trim(msg.output) ~= "" then
+		for _, l in ipairs(vim.split(msg.output, "\n", { plain = true })) do
+			out[#out + 1] = "   │ " .. l
+		end
+	else
+		out[#out + 1] = "   ✓"
+	end
+	return out
 end
 
 -- A tool call REPLAYED from history: one block carrying the whole call (title + result),

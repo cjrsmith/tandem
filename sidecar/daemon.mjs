@@ -22,7 +22,7 @@ import os from "node:os";
 import path from "node:path";
 
 const MODEL = { providerID: "opencode", modelID: "north-mini-code-free" };
-const VERSION = "2026-07-04 tool-events";
+const VERSION = "2026-07-09 permission-asked-fix";
 
 // tandem_instruct: the Navigator gives the human ONE directive (a next step). Sticky,
 // non-blocking — shown in the notification bar until dismissed / next asked.
@@ -367,6 +367,7 @@ async function listModels(tag) {
 // resolves the waiting promise. Shared by the OpenCode event handler below and the
 // Claude backend's canUseTool.
 const pendingPermissions = new Map(); // id -> resolve
+const askedPermissions = new Set(); // permission ids already surfaced (dedupe asked/updated)
 let permN = 0;
 function requestPermission({ tool, command }) {
   return new Promise((resolve) => {
@@ -426,12 +427,26 @@ function toolLabel(tool, input = {}) {
 function handleEvent(event) {
   {
     const p = event.properties || {};
+    if (process.env.TANDEM_DEBUG && String(event.type).startsWith("permission")) {
+      debug("PERMISSION EVENT", event.type, JSON.stringify(p).slice(0, 240));
+    }
     // Permission asks arrive as their own event (not tied to a streaming request):
     // ask the editor, then reply once/always/reject. Handle before the `active` guard.
-    if (event.type === "permission.updated" && p.id && p.sessionID) {
+    //
+    // The server emits `permission.asked` (observed on the wire); the SDK's v1 types only
+    // name `permission.updated`, so accept both. The payload carries the tool in
+    // `permission` (NOT `type`), the command in `metadata.command`, and `patterns[0]`.
+    if ((event.type === "permission.asked" || event.type === "permission.updated") && p.id && p.sessionID) {
+      if (askedPermissions.has(p.id)) return; // both events can fire for one ask
+      askedPermissions.add(p.id);
+      const tool = p.permission || p.type || "tool";
       const command =
-        (p.metadata && (p.metadata.command || p.metadata.cmd || p.metadata.url)) || p.title || p.type;
-      requestPermission({ tool: p.type, command: String(command) }).then((decision) => {
+        (p.metadata && (p.metadata.command || p.metadata.cmd || p.metadata.url)) ||
+        (Array.isArray(p.patterns) && p.patterns[0]) ||
+        p.title ||
+        tool;
+      requestPermission({ tool: String(tool), command: String(command) }).then((decision) => {
+        askedPermissions.delete(p.id);
         client
           .postSessionIdPermissionsPermissionId({
             path: { id: p.sessionID, permissionID: p.id },
@@ -456,18 +471,24 @@ function handleEvent(event) {
         // Full tool-call events (name + title + output) for the activity bar and the
         // command-centre transcript — beyond the one-line status. Emit start once,
         // then done/error once.
+        // The tool's input streams in, so early updates have no command yet and the title
+        // degrades to a useless "running: command". Hold the header until we have detail;
+        // if the tool finishes before that, `done` carries the header itself.
+        const hasDetail = !!(part.state.title || (part.state.input && Object.keys(part.state.input).length > 0));
         if (st === "running" || st === "pending") {
           label = title;
-          if (toolPhase.get(key) !== "running") {
+          if (hasDetail && toolPhase.get(key) !== "running") {
             toolPhase.set(key, "running");
             send({ type: "tool", phase: "running", tool: part.tool, title, session: part.sessionID });
           }
         } else if (st === "completed" && toolPhase.get(key) !== "done") {
+          const showedHeader = toolPhase.get(key) === "running";
           toolPhase.set(key, "done");
-          send({ type: "tool", phase: "done", tool: part.tool, title, output: trimOutput(part.state.output), session: part.sessionID });
+          send({ type: "tool", phase: "done", tool: part.tool, title, header: !showedHeader, output: trimOutput(part.state.output), session: part.sessionID });
         } else if (st === "error" && toolPhase.get(key) !== "done") {
+          const showedHeader = toolPhase.get(key) === "running";
           toolPhase.set(key, "done");
-          send({ type: "tool", phase: "error", tool: part.tool, title, error: String(part.state.error || "error"), session: part.sessionID });
+          send({ type: "tool", phase: "error", tool: part.tool, title, header: !showedHeader, error: String(part.state.error || "error"), session: part.sessionID });
         }
       } else if (part.type === "reasoning") {
         label = "thinking…";
