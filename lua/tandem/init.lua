@@ -662,6 +662,37 @@ end
 -- pane (bottom-left), and the read-only attribute rail (right). Returns the buffers/
 -- windows + helpers; the caller wires what happens on submit. `box` carries the outer
 -- geometry { T, L, Wt, Ht, rail_w, input_h, min_lw } in editor cells.
+-- nvim_buf_set_lines rejects a "line" containing a newline, and the strings we render
+-- can easily hold one — a tool title that's a multi-line bash heredoc, a stack trace in
+-- an error, a multi-line question. Flatten any block into newline-free lines.
+local function flatten_lines(block)
+	local out = {}
+	for _, l in ipairs(block or {}) do
+		l = tostring(l):gsub("\r", "")
+		if l:find("\n", 1, true) then
+			for _, s in ipairs(vim.split(l, "\n", { plain = true })) do
+				out[#out + 1] = s
+			end
+		else
+			out[#out + 1] = l
+		end
+	end
+	return out
+end
+
+-- Collapse whitespace/newlines into one display line (for labels and titles).
+local function one_line(s, maxw)
+	s = vim.trim((tostring(s or ""):gsub("%s+", " ")))
+	maxw = maxw or 90
+	if vim.fn.strdisplaywidth(s) > maxw then
+		while #s > 0 and vim.fn.strdisplaywidth(s) > maxw - 1 do
+			s = s:sub(1, -2)
+		end
+		s = s .. "…"
+	end
+	return s
+end
+
 local function make_panel(box, title_label)
 	local T, L, Wt, Ht = box.T, box.L, box.Wt, box.Ht
 	local RW = box.rail_w or 0
@@ -752,6 +783,7 @@ local function make_panel(box, title_label)
 		if not vim.api.nvim_buf_is_valid(conv_buf) then
 			return
 		end
+		block = flatten_lines(block) -- embedded newlines would throw from set_lines
 		local cnt = vim.api.nvim_buf_line_count(conv_buf)
 		local empty = (cnt == 1 and vim.api.nvim_buf_get_lines(conv_buf, 0, 1, false)[1] == "")
 		local start = empty and 0 or cnt
@@ -797,6 +829,7 @@ local function make_panel(box, title_label)
 	-- in chronological order between reply segments.
 	function P.append_tool(lines)
 		P.commit_stream()
+		lines = flatten_lines(lines) -- flatten first so the highlight count matches
 		local start = P.append(lines)
 		if start then
 			for i = start, start + #lines - 1 do
@@ -2834,6 +2867,7 @@ local function toollog_render()
 	if #tail == 0 then
 		tail = { "⚙  (no activity yet)" }
 	end
+	tail = flatten_lines(tail) -- never hand set_lines an embedded newline
 	local width = math.min(vim.o.columns - 2, 110)
 	if log.win and vim.api.nvim_win_is_valid(log.win) then
 		vim.api.nvim_buf_set_lines(log.buf, 0, -1, false, tail)
@@ -2858,9 +2892,10 @@ end
 -- One tool event → log line(s).
 local function tool_log_lines(msg)
 	if msg.phase == "running" then
-		return { "⚙  " .. (msg.title or msg.tool or "tool") }
+		-- a bash title can be a whole multi-line heredoc — collapse it to one line
+		return { "⚙  " .. one_line(msg.title or msg.tool or "tool") }
 	elseif msg.phase == "error" then
-		return { "   ✗ " .. (msg.error or "error") }
+		return { "   ✗ " .. one_line(msg.error or "error") }
 	else -- done
 		if msg.output and vim.trim(msg.output) ~= "" then
 			local out = {}
@@ -2876,9 +2911,10 @@ end
 -- A tool call REPLAYED from history: one block carrying the whole call (title + result),
 -- rather than the two live events. Same visual shape as the live rendering.
 local function tool_block_lines(b)
-	local lines = { "⚙  " .. (b.title or b.tool or "tool") }
+	-- titles can be whole multi-line shell heredocs; keep them to one display line
+	local lines = { "⚙  " .. one_line(b.title or b.tool or "tool") }
 	if b.error then
-		lines[#lines + 1] = "   ✗ " .. b.error
+		lines[#lines + 1] = "   ✗ " .. one_line(b.error)
 	elseif b.output and vim.trim(b.output) ~= "" then
 		for _, l in ipairs(vim.split(b.output, "\n", { plain = true })) do
 			lines[#lines + 1] = "   │ " .. l
