@@ -302,8 +302,17 @@ debug("daemon up at", server.url);
 
 // Apply a reasoning effort to an OpenCode model by setting its options.reasoningEffort
 // and pushing the whole config live (what the TUI's Ctrl+T does under the hood).
+//
+// IMPORTANT: config.update makes OpenCode rewrite the project config, which trips its
+// file watcher → it disposes and recreates the instance → the SSE event stream drops.
+// So only push when the effort ACTUALLY changed; doing it every prompt churned the
+// instance on each turn and left the daemon blind (missed permission asks + session.idle).
+let lastEffortKey = null;
 async function setOpencodeEffort(model, effort) {
   if (!model || !model.providerID || !model.modelID) return;
+  const key = model.providerID + "/" + model.modelID + "/" + (effort || "");
+  if (key === lastEffortKey) return; // already applied — don't recreate the instance
+  lastEffortKey = key;
   daemonConfig.provider = daemonConfig.provider || {};
   const prov = (daemonConfig.provider[model.providerID] = daemonConfig.provider[model.providerID] || {});
   prov.models = prov.models || {};
@@ -413,9 +422,9 @@ function toolLabel(tool, input = {}) {
   }
 }
 
-const events = await client.event.subscribe();
-(async () => {
-  for await (const event of events.stream) {
+// Handle one event from the OpenCode stream.
+function handleEvent(event) {
+  {
     const p = event.properties || {};
     // Permission asks arrive as their own event (not tied to a streaming request):
     // ask the editor, then reply once/always/reject. Handle before the `active` guard.
@@ -430,10 +439,10 @@ const events = await client.event.subscribe();
           })
           .catch((e) => debug("permission reply error", e));
       });
-      continue;
+      return;
     }
     const req = active.get(p.sessionID);
-    if (!req) continue;
+    if (!req) return;
     if (event.type === "message.part.updated" && p.part) {
       const part = p.part;
       partType.set(part.id, part.type); // learn each part's type
@@ -482,7 +491,41 @@ const events = await client.event.subscribe();
       active.delete(p.sessionID);
     }
   }
-})().catch((e) => debug("event loop error", e));
+}
+
+// The event stream is a long-lived SSE, and OpenCode DROPS it whenever it recreates its
+// instance (e.g. a project config change). Losing it silently makes the daemon blind:
+// no deltas, no session.idle (so turns never finish and the spinner spins forever), and
+// no permission asks (so the model blocks until someone cancels). Re-subscribe forever.
+(async () => {
+  let first = true;
+  for (;;) {
+    try {
+      const events = await client.event.subscribe();
+      if (!first) {
+        debug("event stream reconnected");
+        // A turn may have been in flight while we were blind — surface it rather than
+        // leaving the editor spinning on a request whose events we missed.
+        for (const [sid, req] of active) {
+          send({ tag: req.tag, type: "error", error: "Lost the OpenCode event stream mid-turn (reconnected). The turn may have been interrupted — please retry." });
+          active.delete(sid);
+        }
+      }
+      first = false;
+      for await (const event of events.stream) {
+        try {
+          handleEvent(event);
+        } catch (e) {
+          debug("event handler error", e);
+        }
+      }
+      debug("event stream ended — resubscribing");
+    } catch (e) {
+      debug("event stream error — resubscribing", e);
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+})();
 
 async function handlePrompt(cmd) {
   let sid = cmd.session;

@@ -847,7 +847,9 @@ local function make_panel(box, title_label)
 		vim.keymap.set("n", "?", M.settings_menu, { buffer = b })
 	end
 	vim.keymap.set("n", "<Tab>", P.focus_conv, { buffer = input_buf })
-	vim.keymap.set({ "n", "i" }, "<C-c>", M.cancel_all, { buffer = input_buf })
+	-- NORMAL mode only: <C-c> is how many people leave insert mode, and binding it there
+	-- silently aborted the running turn (OpenCode logs it as `cancel` → error=Aborted).
+	vim.keymap.set("n", "<C-c>", M.cancel_all, { buffer = input_buf })
 	-- @ → pick a file to reference (its content is injected into the prompt on send)
 	vim.keymap.set("i", "@", function()
 		M.pick_reference(function(choice)
@@ -1683,8 +1685,16 @@ end
 function M.on_permission(msg)
 	local tool = msg.tool or "a tool"
 	local command = msg.command or ""
+	local label = (command ~= "" and command ~= tool) and (tool .. " · " .. command) or tool
 	vim.schedule(function()
-		local label = (command ~= "" and command ~= tool) and (tool .. " · " .. command) or tool
+		-- A blocked permission looks exactly like "thinking…" unless we say so: the model
+		-- is frozen until you answer. Make it loud (status line + sticky toast) so a
+		-- missed prompt can never masquerade as a stuck/slow turn.
+		M.on_status({ label = "⚠ needs your permission: " .. tool })
+		M.toast("⚠ Tandem needs permission to run:\n\n" .. label .. "\n\nAnswer the prompt to continue.", {
+			sticky = true,
+			title = " permission ",
+		})
 		vim.ui.select({ "Allow once", "Allow always (this session)", "Reject" }, {
 			prompt = "Tandem — run  " .. label .. "  ?",
 		}, function(choice)
@@ -1694,6 +1704,8 @@ function M.on_permission(msg)
 			elseif choice and choice:match("^Allow always") then
 				decision = "always"
 			end
+			M.toast_dismiss()
+			M.on_status({ label = decision == "reject" and "permission rejected" or "working…" })
 			send_cmd({ cmd = "permission_reply", id = msg.id, decision = decision })
 		end)
 	end)
