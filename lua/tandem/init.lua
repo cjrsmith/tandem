@@ -1064,15 +1064,21 @@ function M.chat_here(mode, scope, opts)
 			if not vim.api.nvim_buf_is_valid(P.conv_buf) then
 				return
 			end
+			-- bubbles stay conversational: replay the prose blocks, not the tool calls
+			-- (the command centre is the source of truth for those).
 			for _, m in ipairs(messages) do
-				local txt = vim.trim(m.text or "")
-				if txt ~= "" then
-					if m.role == "user" then
-						P.append_user(txt)
-					else
-						local lines = vim.split(txt, "\n", { plain = true })
-						lines[#lines + 1] = ""
-						P.append(lines)
+				for _, b in ipairs(m.blocks or {}) do
+					if b.type == "text" then
+						local txt = vim.trim(b.text or "")
+						if txt ~= "" then
+							if m.role == "user" then
+								P.append_user(txt)
+							else
+								local lines = vim.split(txt, "\n", { plain = true })
+								lines[#lines + 1] = ""
+								P.append(lines)
+							end
+						end
 					end
 				end
 			end
@@ -1981,10 +1987,10 @@ function M.fetch_history(session, cb)
 	daemon.handlers[tag] = function(msg)
 		if msg.type == "history" then
 			daemon.handlers[tag] = nil
-			cb(msg.messages or {})
+			cb(msg.messages or {}, msg.busy) -- busy = a turn is still running for this session
 		elseif msg.type == "error" then
 			daemon.handlers[tag] = nil
-			cb({})
+			cb({}, false)
 		end
 	end
 	send_cmd({ cmd = "history", tag = tag, session = session, backend = M.backend() })
@@ -2867,6 +2873,24 @@ local function tool_log_lines(msg)
 	end
 end
 
+-- A tool call REPLAYED from history: one block carrying the whole call (title + result),
+-- rather than the two live events. Same visual shape as the live rendering.
+local function tool_block_lines(b)
+	local lines = { "⚙  " .. (b.title or b.tool or "tool") }
+	if b.error then
+		lines[#lines + 1] = "   ✗ " .. b.error
+	elseif b.output and vim.trim(b.output) ~= "" then
+		for _, l in ipairs(vim.split(b.output, "\n", { plain = true })) do
+			lines[#lines + 1] = "   │ " .. l
+		end
+	elseif b.status == "running" or b.status == "pending" then
+		lines[#lines + 1] = "   … running"
+	else
+		lines[#lines + 1] = "   ✓"
+	end
+	return lines
+end
+
 -- A tool call happened (running/done/error). Append to the activity log (+ later the
 -- main transcript). Routed from on_stdout.
 function M.on_tool(msg)
@@ -3007,6 +3031,17 @@ function M.activity_reset()
 			pcall(P.clear_status)
 		end
 		M._status_panels[P] = nil
+	end
+	-- The command centre was reopened mid-turn, so it never received that turn's streamed
+	-- text (it belonged to the panel that started it). Now the turn is over, replay the
+	-- session so the reply — and its tool calls — actually show up.
+	local main = M._main
+	if main and main._resync_on_idle and vim.api.nvim_buf_is_valid(main.conv_buf) then
+		main._resync_on_idle = nil
+		local session = M.active_session
+		vim.schedule(function()
+			M.render_transcript(main, session)
+		end)
 	end
 end
 
@@ -3340,21 +3375,38 @@ function M.render_transcript(P, session)
 	end
 	vim.api.nvim_buf_set_lines(P.conv_buf, 0, -1, false, {}) -- clear old transcript
 	vim.api.nvim_buf_clear_namespace(P.conv_buf, chat_ns, 0, -1) -- and its user-msg highlights
-	M.fetch_history(session, function(messages)
-		if not vim.api.nvim_buf_is_valid(P.conv_buf) or #messages == 0 then
+	P.clear_status()
+	M.fetch_history(session, function(messages, busy)
+		if not vim.api.nvim_buf_is_valid(P.conv_buf) then
 			return
 		end
+		-- Replay the session as ORDERED blocks — prose AND tool calls — so reopening a
+		-- chat shows everything that happened, not just the text.
 		for _, m in ipairs(messages) do
-			local txt = vim.trim(m.text or "")
-			if txt ~= "" then
-				if m.role == "user" then
-					P.append_user(txt)
-				else
-					local lines = vim.split(txt, "\n", { plain = true })
-					lines[#lines + 1] = ""
-					P.append(lines)
+			for _, b in ipairs(m.blocks or {}) do
+				if b.type == "text" then
+					local txt = vim.trim(b.text or "")
+					if txt ~= "" then
+						if m.role == "user" then
+							P.append_user(txt)
+						else
+							local lines = vim.split(txt, "\n", { plain = true })
+							lines[#lines + 1] = ""
+							P.append(lines)
+						end
+					end
+				elseif b.type == "tool" then
+					P.append_tool(tool_block_lines(b))
 				end
 			end
+		end
+		-- A turn is STILL running for this session (you reopened mid-flight): show the
+		-- live status footer, and refresh the transcript once the turn finishes — its
+		-- streaming text belongs to the panel that started it, which may be gone.
+		if busy then
+			M._status_panels[P] = true
+			P.set_status("⠋  working…")
+			P._resync_on_idle = true
 		end
 	end)
 end

@@ -607,20 +607,34 @@ rl.on("line", (line) => {
   } else if (cmd.cmd === "compact" && cmd.session && claude) {
     getClaude().then((b) => b.compact(cmd)).catch((e) => send({ tag: cmd.tag, type: "error", error: String(e) }));
   } else if (cmd.cmd === "history" && cmd.session) {
-    // Return the session's prior messages (role + concatenated text parts).
+    // Return the session as ORDERED blocks (text AND tool calls), so reopening a chat
+    // replays the full session the way OpenCode/Claude Code show it — not just the prose.
+    // `busy` tells the editor a turn is still in flight for this session.
     client.session
       .messages({ path: { id: cmd.session } })
       .then((res) => {
         const msgs = (res.data || [])
-          .map((m) => ({
-            role: m.info?.role || "?",
-            text: (m.parts || [])
-              .filter((p) => p.type === "text" && p.text)
-              .map((p) => p.text)
-              .join(""),
-          }))
-          .filter((m) => m.text.trim() !== "");
-        send({ tag: cmd.tag, type: "history", messages: msgs });
+          .map((m) => {
+            const blocks = [];
+            for (const p of m.parts || []) {
+              if (p.type === "text" && p.text) {
+                blocks.push({ type: "text", text: p.text });
+              } else if (p.type === "tool" && p.state) {
+                const st = p.state.status;
+                blocks.push({
+                  type: "tool",
+                  tool: p.tool,
+                  title: p.state.title || toolLabel(p.tool, p.state.input),
+                  status: st,
+                  output: st === "completed" ? trimOutput(p.state.output) : undefined,
+                  error: st === "error" ? String(p.state.error || "error") : undefined,
+                });
+              }
+            }
+            return { role: m.info?.role || "?", blocks };
+          })
+          .filter((m) => m.blocks.length > 0);
+        send({ tag: cmd.tag, type: "history", messages: msgs, busy: active.has(cmd.session) });
       })
       .catch((e) => send({ tag: cmd.tag, type: "error", error: String(e) }));
   } else if (cmd.cmd === "usage" && cmd.session) {

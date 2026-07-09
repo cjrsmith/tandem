@@ -303,14 +303,16 @@ export function createClaudeBackend({ send, cwd, defaultSystem, requestPermissio
     for (const a of bySession.values()) a.abort();
   }
 
+  // Same ORDERED-blocks shape as the OpenCode backend, so the editor has one code path.
+  // (Claude transcripts are text-only here; tool_use blocks aren't replayed yet.)
   async function history(cmd) {
     try {
       const raw = await getSessionMessages(cmd.session, { dir: cwd });
       const messages = raw
         .filter((m) => m.type === "user" || m.type === "assistant")
-        .map((m) => ({ role: m.type, text: messageText(m.message) }))
-        .filter((m) => m.text.trim() !== "");
-      send({ tag: cmd.tag, type: "history", messages });
+        .map((m) => ({ role: m.type, blocks: [{ type: "text", text: messageText(m.message) }] }))
+        .filter((m) => m.blocks[0].text.trim() !== "");
+      send({ tag: cmd.tag, type: "history", messages, busy: bySession.has(cmd.session) });
     } catch (e) {
       send({ tag: cmd.tag, type: "error", error: String(e) });
     }
