@@ -22,7 +22,7 @@ import os from "node:os";
 import path from "node:path";
 
 const MODEL = { providerID: "opencode", modelID: "north-mini-code-free" };
-const VERSION = "2026-07-09 permission-asked-fix";
+const VERSION = "2026-07-22-history-paging-tool-lifecycle";
 
 // tandem_instruct: the Navigator gives the human ONE directive (a next step). Sticky,
 // non-blocking — shown in the notification bar until dismissed / next asked.
@@ -387,10 +387,65 @@ process.on("SIGINT", () => shutdown(0));
 // One global event stream for the whole server; route each event to the request
 // that owns its session. `active` maps a sessionID to the request currently
 // streaming from it.
-const active = new Map(); // sessionID -> { tag }
+const TURN_IDLE_TIMEOUT_MS = 45000;
+const active = new Map(); // sessionID -> { tag, timer, text }
 const partType = new Map(); // partID -> "text" | "reasoning" | ... (to filter reasoning)
 const toolPhase = new Map(); // callID -> last tool phase emitted ("running"|"done")
 let lastStatus = ""; // dedupe the one-line status we push to the editor
+function clearActive(sid) {
+  const req = active.get(sid);
+  if (req && req.timer) clearTimeout(req.timer);
+  active.delete(sid);
+}
+function armIdleWatchdog(sid, tag) {
+  const existing = active.get(sid);
+  const timer = setTimeout(() => {
+    if (!active.has(sid)) return;
+    client.session.abort({ path: { id: sid } }).catch((e) => debug("watchdog abort error", e));
+    send({ tag, type: "error", error: "Timed out waiting for OpenCode to report turn completion. Tandem aborted the stuck backend turn so later messages are not queued behind it." });
+    clearActive(sid);
+  }, TURN_IDLE_TIMEOUT_MS);
+  active.set(sid, { tag, timer, text: existing ? existing.text || "" : "" });
+}
+function bumpIdleWatchdog(sid) {
+  const req = active.get(sid);
+  if (!req) return;
+  if (req.timer) clearTimeout(req.timer);
+  armIdleWatchdog(sid, req.tag);
+}
+function assistantText(message) {
+  const blocks = [];
+  for (const part of message.parts || []) {
+    if (part.type === "text" && part.text) blocks.push(part.text);
+  }
+  return blocks.join("");
+}
+async function completeTurn(sid, req, error) {
+  if (!active.has(sid) || req.completing) return;
+  req.completing = true;
+  if (req.timer) clearTimeout(req.timer);
+  if (!error) {
+    try {
+      const res = await client.session.messages({ path: { id: sid } });
+      const messages = res.data || [];
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i];
+        if ((m.info && m.info.role) !== "assistant") continue;
+        const full = assistantText(m);
+        const streamed = req.text || "";
+        if (full && full.length > streamed.length) {
+          send({ tag: req.tag, type: "delta", text: full.startsWith(streamed) ? full.slice(streamed.length) : full });
+        }
+        break;
+      }
+    } catch (e) {
+      debug("completion reconcile failed", e);
+    }
+  }
+  if (error) send({ tag: req.tag, type: "error", error });
+  else send({ tag: req.tag, type: "done" });
+  clearActive(sid);
+}
 
 // Trim a tool's output for display (bash etc. can be huge). Keeps the head.
 function trimOutput(s, maxLines = 12, maxChars = 1000) {
@@ -456,9 +511,37 @@ function handleEvent(event) {
       });
       return;
     }
-    const req = active.get(p.sessionID);
+    const sid = p.sessionID || (p.info && p.info.sessionID) || (p.part && p.part.sessionID);
+    const req = active.get(sid);
     if (!req) return;
-    if (event.type === "message.part.updated" && p.part) {
+    bumpIdleWatchdog(sid);
+    if (event.type === "session.status" && p.status && p.status.type === "busy") {
+      if (lastStatus !== "working…") {
+        lastStatus = "working…";
+        send({ type: "status", label: "working…" });
+      }
+    } else if (event.type === "session.status" && p.status && p.status.type === "idle") {
+      lastStatus = "";
+      toolPhase.clear();
+      completeTurn(sid, req);
+    } else if (event.type === "session.next.step.ended") {
+      lastStatus = "";
+      toolPhase.clear();
+      completeTurn(sid, req);
+    } else if (event.type === "session.next.step.failed") {
+      lastStatus = "";
+      toolPhase.clear();
+      completeTurn(sid, req, p.error || "step failed");
+    } else if (event.type === "message.updated" && p.info && p.info.role === "assistant" && p.info.time && p.info.time.completed) {
+      // finish="tool-calls" is an intermediate assistant message: OpenCode is about
+      // to run tools and then stream a second assistant message with the final text.
+      // Do not clear the active turn here or those final deltas get dropped.
+      if (p.info.finish !== "tool-calls") {
+        lastStatus = "";
+        toolPhase.clear();
+        completeTurn(sid, req, p.info.error);
+      }
+    } else if (event.type === "message.part.updated" && p.part) {
       const part = p.part;
       partType.set(part.id, part.type); // learn each part's type
       // Surface what the AI is doing as a one-line status (global; the editor shows
@@ -479,16 +562,16 @@ function handleEvent(event) {
           label = title;
           if (hasDetail && toolPhase.get(key) !== "running") {
             toolPhase.set(key, "running");
-            send({ type: "tool", phase: "running", tool: part.tool, title, session: part.sessionID });
+            send({ type: "tool", phase: "running", tool: part.tool, title, session: sid });
           }
         } else if (st === "completed" && toolPhase.get(key) !== "done") {
           const showedHeader = toolPhase.get(key) === "running";
           toolPhase.set(key, "done");
-          send({ type: "tool", phase: "done", tool: part.tool, title, header: !showedHeader, output: trimOutput(part.state.output), session: part.sessionID });
+          send({ type: "tool", phase: "done", tool: part.tool, title, header: !showedHeader, output: trimOutput(part.state.output), session: sid });
         } else if (st === "error" && toolPhase.get(key) !== "done") {
           const showedHeader = toolPhase.get(key) === "running";
           toolPhase.set(key, "done");
-          send({ type: "tool", phase: "error", tool: part.tool, title, header: !showedHeader, error: String(part.state.error || "error"), session: part.sessionID });
+          send({ type: "tool", phase: "error", tool: part.tool, title, header: !showedHeader, error: String(part.state.error || "error"), session: sid });
         }
       } else if (part.type === "reasoning") {
         label = "thinking…";
@@ -500,16 +583,15 @@ function handleEvent(event) {
     } else if (event.type === "message.part.delta" && p.field === "text" && p.delta) {
       // Drop the model's "thinking" — only stream actual answer (text) parts.
       if (partType.get(p.partID) !== "reasoning") {
+        req.text = (req.text || "") + p.delta;
         send({ tag: req.tag, type: "delta", text: p.delta });
       }
     } else if (event.type === "session.idle") {
       lastStatus = ""; // reset so the next turn re-emits its status
       toolPhase.clear();
-      send({ tag: req.tag, type: "done" });
-      active.delete(p.sessionID);
+      completeTurn(sid, req);
     } else if (event.type === "session.error") {
-      send({ tag: req.tag, type: "error", error: p });
-      active.delete(p.sessionID);
+      completeTurn(sid, req, p);
     }
   }
 }
@@ -529,7 +611,7 @@ function handleEvent(event) {
         // leaving the editor spinning on a request whose events we missed.
         for (const [sid, req] of active) {
           send({ tag: req.tag, type: "error", error: "Lost the OpenCode event stream mid-turn (reconnected). The turn may have been interrupted — please retry." });
-          active.delete(sid);
+          clearActive(sid);
         }
       }
       first = false;
@@ -559,7 +641,7 @@ async function handlePrompt(cmd) {
     const created = await client.session.create({ body: {} });
     sid = created.data.id; // a fresh session = fresh memory
   }
-  active.set(sid, { tag: cmd.tag });
+  armIdleWatchdog(sid, cmd.tag);
   send({ tag: cmd.tag, type: "session", id: sid });
   // Reasoning effort: OpenCode reads it from the model's config options, so push it
   // live before the turn (the model carries whether it's applicable).
@@ -606,7 +688,12 @@ rl.on("line", (line) => {
     if (claude) {
       getClaude().then((b) => b.handlePrompt(cmd)).catch((e) => send({ tag: cmd.tag, type: "error", error: String(e) }));
     } else {
-      handlePrompt(cmd).catch((e) => send({ tag: cmd.tag, type: "error", error: String(e) }));
+      handlePrompt(cmd).catch((e) => {
+        for (const [sid, req] of active) {
+          if (req.tag === cmd.tag) clearActive(sid);
+        }
+        send({ tag: cmd.tag, type: "error", error: String(e) });
+      });
     }
   } else if (cmd.cmd === "cancel" && cmd.session) {
     // Abort the running turn for this session (the user hit cancel).
@@ -634,7 +721,12 @@ rl.on("line", (line) => {
     client.session
       .messages({ path: { id: cmd.session } })
       .then((res) => {
-        const msgs = (res.data || [])
+        const all = res.data || [];
+        const total = all.length;
+        const before = Number.isFinite(cmd.before) ? Math.max(0, Math.min(total, cmd.before)) : total;
+        const limit = Number.isFinite(cmd.limit) ? Math.max(1, cmd.limit) : total;
+        const start = Math.max(0, before - limit);
+        const msgs = all.slice(start, before)
           .map((m) => {
             const blocks = [];
             for (const p of m.parts || []) {
@@ -655,7 +747,7 @@ rl.on("line", (line) => {
             return { role: m.info?.role || "?", blocks };
           })
           .filter((m) => m.blocks.length > 0);
-        send({ tag: cmd.tag, type: "history", messages: msgs, busy: active.has(cmd.session) });
+        send({ tag: cmd.tag, type: "history", messages: msgs, busy: active.has(cmd.session), start, total, has_more: start > 0 });
       })
       .catch((e) => send({ tag: cmd.tag, type: "error", error: String(e) }));
   } else if (cmd.cmd === "usage" && cmd.session) {

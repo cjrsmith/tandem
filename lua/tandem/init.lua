@@ -72,6 +72,7 @@ end
 M.active_session = nil -- the current working session, shared across bubbles
 M.active_edit = nil -- { buf, srow, erow } — where the AI is currently writing code
 M._status_panels = setmetatable({}, { __mode = "k" }) -- chat panels showing a live status footer
+local HISTORY_PAGE = 40 -- newest messages rendered first; older pages load on upward scroll
 
 -- Models for the picker. This is a FALLBACK; M.fetch_models replaces it with the models
 -- actually available through the backends (OpenCode providers + Claude). Each entry:
@@ -742,6 +743,16 @@ local function make_panel(box, title_label)
 		rail_buf = rail_buf, rail_win = rail_win,
 	}
 
+	function P.follow_tail()
+		if vim.api.nvim_win_is_valid(conv_win) and vim.api.nvim_buf_is_valid(conv_buf) then
+			local last = math.max(1, vim.api.nvim_buf_line_count(conv_buf))
+			pcall(vim.api.nvim_win_set_cursor, conv_win, { last, 0 })
+			pcall(vim.api.nvim_win_call, conv_win, function()
+				vim.cmd("normal! zb")
+			end)
+		end
+	end
+
 	function P.close()
 		if M._rail_buf == rail_buf then
 			M._rail_buf, M._rail_win = nil, nil
@@ -788,9 +799,7 @@ local function make_panel(box, title_label)
 		local empty = (cnt == 1 and vim.api.nvim_buf_get_lines(conv_buf, 0, 1, false)[1] == "")
 		local start = empty and 0 or cnt
 		vim.api.nvim_buf_set_lines(conv_buf, start, empty and 1 or cnt, false, block)
-		if vim.api.nvim_win_is_valid(conv_win) and vim.api.nvim_get_current_win() ~= conv_win then
-			vim.api.nvim_win_set_cursor(conv_win, { vim.api.nvim_buf_line_count(conv_buf), 0 })
-		end
+		P.follow_tail()
 		return start
 	end
 
@@ -810,9 +819,7 @@ local function make_panel(box, title_label)
 		end
 		vim.api.nvim_buf_set_lines(conv_buf, P._sr, P._sr + P._sc, false, lines)
 		P._sc = #lines
-		if vim.api.nvim_win_is_valid(conv_win) and vim.api.nvim_get_current_win() ~= conv_win then
-			vim.api.nvim_win_set_cursor(conv_win, { vim.api.nvim_buf_line_count(conv_buf), 0 })
-		end
+		P.follow_tail()
 	end
 	function P.commit_stream()
 		if P._sr and vim.api.nvim_buf_is_valid(conv_buf) then
@@ -838,6 +845,32 @@ local function make_panel(box, title_label)
 		end
 	end
 
+	function P.prepend_transcript(lines, user_ranges, tool_ranges)
+		if not vim.api.nvim_buf_is_valid(conv_buf) or #lines == 0 then
+			return
+		end
+		lines = flatten_lines(lines)
+		local cur = vim.api.nvim_buf_line_count(conv_buf)
+		local empty = (cur == 1 and vim.api.nvim_buf_get_lines(conv_buf, 0, 1, false)[1] == "")
+		vim.api.nvim_buf_set_lines(conv_buf, 0, empty and 1 or 0, false, lines)
+		for _, r in ipairs(user_ranges or {}) do
+			for i = r[1], r[2] do
+				pcall(vim.api.nvim_buf_set_extmark, conv_buf, chat_ns, i - 1, 0, { line_hl_group = "TandemUserMsg" })
+			end
+		end
+		for _, r in ipairs(tool_ranges or {}) do
+			for i = r[1], r[2] do
+				pcall(vim.api.nvim_buf_set_extmark, conv_buf, chat_ns, i - 1, 0, { line_hl_group = "TandemRailLabel" })
+			end
+		end
+		if vim.api.nvim_win_is_valid(conv_win) then
+			local ok, pos = pcall(vim.api.nvim_win_get_cursor, conv_win)
+			if ok then
+				pcall(vim.api.nvim_win_set_cursor, conv_win, { pos[1] + #lines, pos[2] })
+			end
+		end
+	end
+
 	-- Live "AI is working" footer: a virtual line below the transcript (doesn't consume a
 	-- real line, so it never fights the stream). Animated by the activity timer; cleared
 	-- when the turn ends.
@@ -850,9 +883,7 @@ local function make_panel(box, title_label)
 			id = P._status_id,
 			virt_lines = { { { text, "TandemRailLabel" } } },
 		})
-		if vim.api.nvim_win_is_valid(conv_win) and vim.api.nvim_get_current_win() ~= conv_win then
-			pcall(vim.api.nvim_win_set_cursor, conv_win, { vim.api.nvim_buf_line_count(conv_buf), 0 })
-		end
+		P.follow_tail()
 	end
 	function P.clear_status()
 		if vim.api.nvim_buf_is_valid(conv_buf) then
@@ -932,18 +963,18 @@ end
 
 -- Big centred box for the command centre.
 local function centre_box()
-	local Wt = math.floor(vim.o.columns * 0.86)
-	local Ht = math.floor(vim.o.lines * 0.82)
+	local Wt = math.floor(vim.o.columns * 0.94)
+	local Ht = math.floor(vim.o.lines * 0.9)
 	return {
 		T = math.floor((vim.o.lines - Ht) / 2), L = math.floor((vim.o.columns - Wt) / 2),
-		Wt = Wt, Ht = Ht, rail_w = 30, input_h = 5, min_lw = 40,
+		Wt = Wt, Ht = Ht, rail_w = 32, input_h = 6, min_lw = 48,
 	}
 end
 
 -- Small box anchored just above the cursor for located bubbles.
 local function cursor_box()
-	local Wt = math.min(78, vim.o.columns - 4)
-	local Ht = math.min(16, vim.o.lines - 4)
+	local Wt = math.min(92, vim.o.columns - 4)
+	local Ht = math.min(22, vim.o.lines - 4)
 	local cr, cc = vim.fn.screenrow(), vim.fn.screencol()
 	local T = cr - 2 - Ht -- above the cursor line
 	if T < 0 then
@@ -951,7 +982,7 @@ local function cursor_box()
 	end
 	T = math.max(0, math.min(T, vim.o.lines - Ht - 1))
 	local L = math.max(0, math.min(cc - 1, vim.o.columns - Wt - 1))
-	return { T = T, L = L, Wt = Wt, Ht = Ht, rail_w = 22, input_h = 4, min_lw = 24, todo = false }
+	return { T = T, L = L, Wt = Wt, Ht = Ht, rail_w = 24, input_h = 5, min_lw = 28, todo = false }
 end
 
 function M.chat_here(mode, scope, opts)
@@ -1093,7 +1124,7 @@ function M.chat_here(mode, scope, opts)
 
 	-- optionally show the prior conversation (bring back the "previous chat")
 	if opts.history and get_session() then
-		M.fetch_history(get_session(), function(messages)
+		M.fetch_history(get_session(), { limit = HISTORY_PAGE }, function(messages)
 			if not vim.api.nvim_buf_is_valid(P.conv_buf) then
 				return
 			end
@@ -1268,11 +1299,20 @@ local function on_stdout(_, data)
 				elseif msg.type == "permission" then
 					M.on_permission(msg) -- a side-effecting tool wants to run — ask first
 				elseif msg.type == "status" then
-					M.on_status(msg) -- one-line "what the AI is doing now"
+					vim.schedule(function()
+						M.on_status(msg) -- one-line "what the AI is doing now"
+					end)
 				elseif msg.type == "tool" then
-					M.on_tool(msg) -- a tool call (running/done/error) → activity bar
+					vim.schedule(function()
+						M.on_tool(msg) -- a tool call (running/done/error) → activity bar
+					end)
 				elseif daemon.handlers[msg.tag] then
-					daemon.handlers[msg.tag](msg)
+					local handler = daemon.handlers[msg.tag]
+					vim.schedule(function()
+						if daemon.handlers[msg.tag] == handler then
+							handler(msg)
+						end
+					end)
 				end
 			end
 		end
@@ -1303,7 +1343,11 @@ function M.restart_daemon()
 	if daemon.job then
 		vim.fn.jobstop(daemon.job)
 	end
-	daemon.job, daemon.ready, daemon.queue = nil, false, {}
+	-- Previous Neovim/plugin reloads can leave orphan sidecars running. Kill only this
+	-- project's exact daemon path so a restart really picks up the current code.
+	pcall(vim.fn.system, { "pkill", "-f", DAEMON })
+	daemon.job, daemon.ready, daemon.queue, daemon.handlers = nil, false, {}, {}
+	M.activity_reset()
 	vim.notify("Tandem: daemon restarted")
 end
 
@@ -2009,10 +2053,16 @@ function M.fetch_models(cb)
 	end, 4000)
 end
 
--- Fetch a session's prior messages; cb(messages) with a list of { role, text }.
-function M.fetch_history(session, cb)
+-- Fetch a session's prior messages. opts.limit bounds the page; opts.before is the
+-- message index to page backward from. cb(messages, busy, page) receives chronological
+-- messages plus { start, total, has_more }.
+function M.fetch_history(session, opts, cb)
+	if type(opts) == "function" then
+		cb, opts = opts, {}
+	end
+	opts = opts or {}
 	if not session then
-		cb({})
+		cb({}, false, { start = 0, total = 0, has_more = false })
 		return
 	end
 	daemon.n = daemon.n + 1
@@ -2020,13 +2070,24 @@ function M.fetch_history(session, cb)
 	daemon.handlers[tag] = function(msg)
 		if msg.type == "history" then
 			daemon.handlers[tag] = nil
-			cb(msg.messages or {}, msg.busy) -- busy = a turn is still running for this session
+			cb(msg.messages or {}, msg.busy, {
+				start = msg.start or 0,
+				total = msg.total or #(msg.messages or {}),
+				has_more = msg.has_more or false,
+			})
 		elseif msg.type == "error" then
 			daemon.handlers[tag] = nil
-			cb({}, false)
+			cb({}, false, { start = 0, total = 0, has_more = false })
 		end
 	end
-	send_cmd({ cmd = "history", tag = tag, session = session, backend = M.backend() })
+	send_cmd({
+		cmd = "history",
+		tag = tag,
+		session = session,
+		backend = M.backend(),
+		limit = opts.limit,
+		before = opts.before,
+	})
 end
 
 -- Fetch token/cost usage for a session; caches into M._usage and refreshes the rail.
@@ -2259,6 +2320,21 @@ function M.set_active_session(id)
 	end
 end
 
+local function reset_open_chat_transcript()
+	local P = M._main
+	if not (P and vim.api.nvim_buf_is_valid(P.conv_buf)) then
+		return
+	end
+	P._history_gen = (P._history_gen or 0) + 1
+	P._history_session = nil
+	P._history_loading = false
+	P._history_has_more = false
+	P._history_start = 0
+	vim.api.nvim_buf_set_lines(P.conv_buf, 0, -1, false, {})
+	vim.api.nvim_buf_clear_namespace(P.conv_buf, chat_ns, 0, -1)
+	P.clear_status()
+end
+
 -- Create a NEW session inside the active workpackage (shares its journal/backlog).
 -- Fresh thread: active_session = nil until its first turn. Uses the current backend.
 function M.new_session(name)
@@ -2271,10 +2347,7 @@ function M.new_session(name)
 	wp_write_manifest(m)
 	M.active_session = nil
 	M._usage = nil
-	-- fresh session → clear the command centre's transcript if it's open
-	if M._main and vim.api.nvim_buf_is_valid(M._main.conv_buf) then
-		M.render_transcript(M._main, nil)
-	end
+	reset_open_chat_transcript()
 	M.rail_refresh()
 	vim.notify("Tandem: new session '" .. name .. "' in " .. m.active.wp)
 end
@@ -2298,6 +2371,7 @@ function M.wp_create(name)
 	pcall(M.ensure_journal, name) -- born with a journal to grow
 	M.active_session = nil
 	M._usage = nil
+	reset_open_chat_transcript()
 	M.rail_refresh()
 	vim.notify("Tandem workpackage → " .. name)
 end
@@ -2423,9 +2497,7 @@ function M.switch_backend(backend)
 	wp_write_manifest(m)
 	M.active_session = nil
 	M._usage = nil
-	if M._main and vim.api.nvim_buf_is_valid(M._main.conv_buf) then
-		M.render_transcript(M._main, nil) -- fresh session → empty transcript
-	end
+	reset_open_chat_transcript()
 	M.rail_refresh()
 	vim.notify("Tandem → default ▸ new session  [" .. backend .. "]")
 end
@@ -2932,6 +3004,39 @@ local function tool_block_lines(b)
 	return lines
 end
 
+local function transcript_lines(messages, include_tools)
+	local lines, user_ranges, tool_ranges = {}, {}, {}
+	local function add_range(ranges, first, last)
+		if last >= first then
+			ranges[#ranges + 1] = { first, last }
+		end
+	end
+	for _, m in ipairs(messages or {}) do
+		for _, b in ipairs(m.blocks or {}) do
+			if b.type == "text" then
+				local txt = vim.trim(b.text or "")
+				if txt ~= "" then
+					local first = #lines + 1
+					for _, l in ipairs(vim.split(txt, "\n", { plain = true })) do
+						lines[#lines + 1] = l
+					end
+					if m.role == "user" then
+						add_range(user_ranges, first, #lines)
+					end
+					lines[#lines + 1] = ""
+				end
+			elseif include_tools and b.type == "tool" then
+				local first = #lines + 1
+				for _, l in ipairs(tool_block_lines(b)) do
+					lines[#lines + 1] = l
+				end
+				add_range(tool_ranges, first, #lines)
+			end
+		end
+	end
+	return flatten_lines(lines), user_ranges, tool_ranges
+end
+
 -- A tool call happened (running/done/error). Append to the activity log (+ later the
 -- main transcript). Routed from on_stdout.
 function M.on_tool(msg)
@@ -2947,9 +3052,13 @@ function M.on_tool(msg)
 	if log.on then
 		toollog_render()
 	end
-	-- main chat = source of truth: weave tool calls into the ACTIVE session's transcript
-	if M._main and vim.api.nvim_buf_is_valid(M._main.conv_buf) and msg.session and msg.session == M.active_session then
-		M._main.append_tool(lines)
+	-- main chat = source of truth: weave tool calls into the displayed session's transcript.
+	local main = M._main
+	if main and vim.api.nvim_buf_is_valid(main.conv_buf) and msg.session then
+		local displayed = main._history_session or M.active_session
+		if msg.session == displayed then
+			main.append_tool(lines)
+		end
 	end
 end
 
@@ -3414,41 +3523,51 @@ function M.render_transcript(P, session)
 	if not (P and vim.api.nvim_buf_is_valid(P.conv_buf)) then
 		return
 	end
+	P._history_gen = (P._history_gen or 0) + 1
+	local gen = P._history_gen
+	P._history_session = session
+	P._history_loading = false
+	P._history_has_more = false
+	P._history_start = 0
 	vim.api.nvim_buf_set_lines(P.conv_buf, 0, -1, false, {}) -- clear old transcript
-	vim.api.nvim_buf_clear_namespace(P.conv_buf, chat_ns, 0, -1) -- and its user-msg highlights
+	vim.api.nvim_buf_clear_namespace(P.conv_buf, chat_ns, 0, -1) -- and its highlights
 	P.clear_status()
-	M.fetch_history(session, function(messages, busy)
-		if not vim.api.nvim_buf_is_valid(P.conv_buf) then
+	if not session then
+		return
+	end
+
+	local function apply_page(messages, busy, page, prepend)
+		if gen ~= P._history_gen or session ~= P._history_session or not vim.api.nvim_buf_is_valid(P.conv_buf) then
 			return
 		end
-		-- Replay the session as ORDERED blocks — prose AND tool calls — so reopening a
-		-- chat shows everything that happened, not just the text.
-		for _, m in ipairs(messages) do
-			for _, b in ipairs(m.blocks or {}) do
-				if b.type == "text" then
-					local txt = vim.trim(b.text or "")
-					if txt ~= "" then
-						if m.role == "user" then
-							P.append_user(txt)
-						else
-							local lines = vim.split(txt, "\n", { plain = true })
-							lines[#lines + 1] = ""
-							P.append(lines)
-						end
-					end
-				elseif b.type == "tool" then
-					P.append_tool(tool_block_lines(b))
-				end
-			end
+		local lines, user_ranges, tool_ranges = transcript_lines(messages, true)
+		P._history_start = page.start or 0
+		P._history_has_more = page.has_more or false
+		P._history_loading = false
+		P.prepend_transcript(lines, user_ranges, tool_ranges)
+		if not prepend and vim.api.nvim_win_is_valid(P.conv_win) then
+			pcall(vim.api.nvim_win_set_cursor, P.conv_win, { math.max(1, vim.api.nvim_buf_line_count(P.conv_buf)), 0 })
 		end
-		-- A turn is STILL running for this session (you reopened mid-flight): show the
-		-- live status footer, and refresh the transcript once the turn finishes — its
-		-- streaming text belongs to the panel that started it, which may be gone.
 		if busy then
 			M._status_panels[P] = true
 			P.set_status("⠋  working…")
 			P._resync_on_idle = true
 		end
+	end
+
+	function P.load_older_history()
+		if P._history_loading or not P._history_has_more or not P._history_session then
+			return
+		end
+		P._history_loading = true
+		M.fetch_history(P._history_session, { limit = HISTORY_PAGE, before = P._history_start }, function(messages, busy, page)
+			apply_page(messages, busy, page, true)
+		end)
+	end
+
+	P._history_loading = true
+	M.fetch_history(session, { limit = HISTORY_PAGE }, function(messages, busy, page)
+		apply_page(messages, busy, page, false)
 	end)
 end
 
@@ -3483,8 +3602,19 @@ function M.open_chat()
 		end)
 	end)
 
-	-- render the session's prior messages into the transcript on open
+	-- render the newest history page first; older pages load when scrolling to the top
 	M.render_transcript(P, M.active_session)
+	vim.api.nvim_create_autocmd({ "WinScrolled", "CursorMoved" }, {
+		buffer = P.conv_buf,
+		callback = function()
+			if P.load_older_history
+				and vim.api.nvim_win_is_valid(P.conv_win)
+				and vim.api.nvim_win_get_cursor(P.conv_win)[1] <= 3
+			then
+				P.load_older_history()
+			end
+		end,
+	})
 
 	-- pull token/cost usage for the active session into the rail
 	M.fetch_usage(M.active_session)

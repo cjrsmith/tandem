@@ -308,11 +308,16 @@ export function createClaudeBackend({ send, cwd, defaultSystem, requestPermissio
   async function history(cmd) {
     try {
       const raw = await getSessionMessages(cmd.session, { dir: cwd });
-      const messages = raw
-        .filter((m) => m.type === "user" || m.type === "assistant")
+      const filtered = raw.filter((m) => m.type === "user" || m.type === "assistant");
+      const total = filtered.length;
+      const before = Number.isFinite(cmd.before) ? Math.max(0, Math.min(total, cmd.before)) : total;
+      const limit = Number.isFinite(cmd.limit) ? Math.max(1, cmd.limit) : total;
+      const start = Math.max(0, before - limit);
+      const messages = filtered
+        .slice(start, before)
         .map((m) => ({ role: m.type, blocks: [{ type: "text", text: messageText(m.message) }] }))
         .filter((m) => m.blocks[0].text.trim() !== "");
-      send({ tag: cmd.tag, type: "history", messages, busy: bySession.has(cmd.session) });
+      send({ tag: cmd.tag, type: "history", messages, busy: bySession.has(cmd.session), start, total, has_more: start > 0 });
     } catch (e) {
       send({ tag: cmd.tag, type: "error", error: String(e) });
     }
