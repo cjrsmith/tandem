@@ -22,7 +22,7 @@ import os from "node:os";
 import path from "node:path";
 
 const MODEL = { providerID: "opencode", modelID: "north-mini-code-free" };
-const VERSION = "2026-07-22-history-paging-tool-lifecycle";
+const VERSION = "2026-07-23-edit-lifecycle-cleanup";
 
 // tandem_instruct: the Navigator gives the human ONE directive (a next step). Sticky,
 // non-blocking — shown in the notification bar until dismissed / next asked.
@@ -387,61 +387,16 @@ process.on("SIGINT", () => shutdown(0));
 // One global event stream for the whole server; route each event to the request
 // that owns its session. `active` maps a sessionID to the request currently
 // streaming from it.
-const TURN_IDLE_TIMEOUT_MS = 45000;
-const active = new Map(); // sessionID -> { tag, timer, text }
+const active = new Map(); // sessionID -> { tag, completing }
 const partType = new Map(); // partID -> "text" | "reasoning" | ... (to filter reasoning)
 const toolPhase = new Map(); // callID -> last tool phase emitted ("running"|"done")
 let lastStatus = ""; // dedupe the one-line status we push to the editor
 function clearActive(sid) {
-  const req = active.get(sid);
-  if (req && req.timer) clearTimeout(req.timer);
   active.delete(sid);
 }
-function armIdleWatchdog(sid, tag) {
-  const existing = active.get(sid);
-  const timer = setTimeout(() => {
-    if (!active.has(sid)) return;
-    client.session.abort({ path: { id: sid } }).catch((e) => debug("watchdog abort error", e));
-    send({ tag, type: "error", error: "Timed out waiting for OpenCode to report turn completion. Tandem aborted the stuck backend turn so later messages are not queued behind it." });
-    clearActive(sid);
-  }, TURN_IDLE_TIMEOUT_MS);
-  active.set(sid, { tag, timer, text: existing ? existing.text || "" : "" });
-}
-function bumpIdleWatchdog(sid) {
-  const req = active.get(sid);
-  if (!req) return;
-  if (req.timer) clearTimeout(req.timer);
-  armIdleWatchdog(sid, req.tag);
-}
-function assistantText(message) {
-  const blocks = [];
-  for (const part of message.parts || []) {
-    if (part.type === "text" && part.text) blocks.push(part.text);
-  }
-  return blocks.join("");
-}
-async function completeTurn(sid, req, error) {
+function completeTurn(sid, req, error) {
   if (!active.has(sid) || req.completing) return;
   req.completing = true;
-  if (req.timer) clearTimeout(req.timer);
-  if (!error) {
-    try {
-      const res = await client.session.messages({ path: { id: sid } });
-      const messages = res.data || [];
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const m = messages[i];
-        if ((m.info && m.info.role) !== "assistant") continue;
-        const full = assistantText(m);
-        const streamed = req.text || "";
-        if (full && full.length > streamed.length) {
-          send({ tag: req.tag, type: "delta", text: full.startsWith(streamed) ? full.slice(streamed.length) : full });
-        }
-        break;
-      }
-    } catch (e) {
-      debug("completion reconcile failed", e);
-    }
-  }
   if (error) send({ tag: req.tag, type: "error", error });
   else send({ tag: req.tag, type: "done" });
   clearActive(sid);
@@ -514,7 +469,6 @@ function handleEvent(event) {
     const sid = p.sessionID || (p.info && p.info.sessionID) || (p.part && p.part.sessionID);
     const req = active.get(sid);
     if (!req) return;
-    bumpIdleWatchdog(sid);
     if (event.type === "session.status" && p.status && p.status.type === "busy") {
       if (lastStatus !== "working…") {
         lastStatus = "working…";
@@ -583,7 +537,6 @@ function handleEvent(event) {
     } else if (event.type === "message.part.delta" && p.field === "text" && p.delta) {
       // Drop the model's "thinking" — only stream actual answer (text) parts.
       if (partType.get(p.partID) !== "reasoning") {
-        req.text = (req.text || "") + p.delta;
         send({ tag: req.tag, type: "delta", text: p.delta });
       }
     } else if (event.type === "session.idle") {
@@ -641,7 +594,7 @@ async function handlePrompt(cmd) {
     const created = await client.session.create({ body: {} });
     sid = created.data.id; // a fresh session = fresh memory
   }
-  armIdleWatchdog(sid, cmd.tag);
+  active.set(sid, { tag: cmd.tag, completing: false });
   send({ tag: cmd.tag, type: "session", id: sid });
   // Reasoning effort: OpenCode reads it from the model's config options, so push it
   // live before the turn (the model carries whether it's applicable).

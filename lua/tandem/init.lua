@@ -332,6 +332,7 @@ end
 -- extmarks: `top_mark` (left gravity — stays above) and `bot_mark` (right gravity —
 -- rides down as text is inserted). We always insert at the bottom mark's CURRENT
 -- position, so the typewriter tracks any edits you make above it while it works.
+local send_cmd -- daemon bridge sender, defined after daemon startup helpers
 local stream = {
 	timer = nil, -- running timer handle, or nil when idle/paused
 	chunks = {}, -- the generated text, split into chunks
@@ -395,8 +396,16 @@ local function tick()
 		return
 	end
 	local row, col = mark_pos(stream.buf, stream.bot_mark)
-	if not row then -- region was removed (e.g. buffer cleared) — stop
+	if not row then -- region was removed (e.g. buffer cleared) — terminalize the edit
 		M.pause()
+		stream.on_done = nil
+		M.clear_edit()
+		if M._edit then
+			local id = M._edit.id
+			M._edit = nil
+			send_cmd({ cmd = "edit_done", id = id, message = "edit stopped because its markers were lost" })
+			M._edit_next()
+		end
 		return
 	end
 	stream.idx = stream.idx + 1
@@ -1262,7 +1271,10 @@ local daemon = {
 }
 
 -- Reassemble stdout into whole JSON lines, then route each by tag.
-local function on_stdout(_, data)
+local function on_stdout(id, data)
+	if daemon.job ~= id then
+		return
+	end
 	daemon.buf = daemon.buf .. table.concat(data, "\n") -- see note on this
 	while true do
 		local nl = daemon.buf:find("\n", 1, true)
@@ -1325,33 +1337,42 @@ local function ensure_daemon()
 	end
 	daemon.job = vim.fn.jobstart({ "node", DAEMON }, {
 		on_stdout = on_stdout,
-		on_exit = function(_, code)
+		on_exit = function(id, code)
+			if daemon.job ~= id then
+				return
+			end
+			local died_mid_request = next(daemon.handlers) ~= nil
 			daemon.job = nil
 			daemon.ready = false
-			if next(daemon.handlers) ~= nil then -- died mid-request
-				vim.schedule(function()
-					M.toast("⚠ Tandem daemon stopped (exit " .. tostring(code) .. ")", { title = " tandem ", timeout = 8000 })
-				end)
-			end
 			daemon.handlers = {}
-			M.activity_reset()
+			daemon.buf = ""
+			vim.schedule(function()
+				M._reset_edit_state(false)
+				M._drain_region_queue()
+				M.activity_reset()
+				if died_mid_request then
+					M.toast("⚠ Tandem daemon stopped (exit " .. tostring(code) .. ")", { title = " tandem ", timeout = 8000 })
+				end
+			end)
 		end,
 	})
 end
 
 function M.restart_daemon()
+	M._reset_edit_state(false)
+	M._drain_region_queue()
 	if daemon.job then
 		vim.fn.jobstop(daemon.job)
 	end
 	-- Previous Neovim/plugin reloads can leave orphan sidecars running. Kill only this
 	-- project's exact daemon path so a restart really picks up the current code.
 	pcall(vim.fn.system, { "pkill", "-f", DAEMON })
-	daemon.job, daemon.ready, daemon.queue, daemon.handlers = nil, false, {}, {}
+	daemon.job, daemon.ready, daemon.queue, daemon.handlers, daemon.buf = nil, false, {}, {}, ""
 	M.activity_reset()
 	vim.notify("Tandem: daemon restarted")
 end
 
-local function send_cmd(cmd)
+send_cmd = function(cmd)
 	ensure_daemon()
 	if daemon.ready then
 		vim.fn.chansend(daemon.job, vim.json.encode(cmd) .. "\n")
@@ -1362,12 +1383,28 @@ end
 
 -- Run the typewriter now, or — when Follow is ON — hold it behind a confirmation so
 -- you always watch each write start. `fn` performs the actual type_out.
-local function gated_write(fn)
+local function gated_write(fn, cancel)
+	local function run()
+		local ok, err = xpcall(fn, debug.traceback)
+		if not ok then
+			if cancel then
+				pcall(cancel)
+			end
+			local id = M._edit and M._edit.id
+			if id then
+				M._edit = nil
+				send_cmd({ cmd = "edit_done", id = id, message = "edit failed before typing: " .. tostring(err) })
+				M._edit_next()
+			end
+			M.toast("⚠ edit failed: " .. tostring(err), { title = " tandem error ", timeout = 8000 })
+		end
+	end
 	if M.follow then
-		M._pending_write = fn
+		M._pending_write = run
+		M._pending_write_cancel = cancel
 		M.toast("▶ ready to write here — confirm to watch it type", { sticky = true, title = " follow · confirm " })
 	else
-		fn()
+		run()
 	end
 end
 
@@ -1375,6 +1412,7 @@ end
 function M.confirm_write()
 	local fn = M._pending_write
 	M._pending_write = nil
+	M._pending_write_cancel = nil
 	M.toast_dismiss()
 	if fn then
 		fn()
@@ -1392,6 +1430,8 @@ end
 -- blocked (no edit_done) until its turn, so the agent's ordering is preserved.
 M._edit_queue = M._edit_queue or {}
 M._edit_busy = M._edit_busy or false
+M._edit_generation = M._edit_generation or 0
+M._edit_scheduled = nil
 
 -- True while an edit is in flight OR queued OR held behind a Follow confirmation.
 function M.busy_editing()
@@ -1403,7 +1443,13 @@ end
 function M._edit_next()
 	local item = table.remove(M._edit_queue, 1)
 	if item then
+		local generation = M._edit_generation
+		M._edit_scheduled = item
 		vim.schedule(function()
+			if M._edit_generation ~= generation or M._edit_scheduled ~= item then
+				return
+			end
+			M._edit_scheduled = nil
 			if item.kind == "region" then
 				M._do_region(item.msg)
 			else
@@ -1423,6 +1469,43 @@ function M._drain_edit_queue()
 	M._edit_busy = false
 	for _, item in ipairs(q) do
 		send_cmd({ cmd = "edit_done", id = item.id, message = "cancelled" })
+	end
+end
+
+-- Clear every local typewriter/edit gate. `ack` is true for cancellation while the
+-- current daemon is alive; restart uses false because its bridge responses are dying.
+function M._reset_edit_state(ack)
+	M.pause()
+	stream.on_done = nil
+	stream.chunks = {}
+	stream.idx = 0
+	M._edit_generation = M._edit_generation + 1
+	local pending_cancel = M._pending_write_cancel
+	M._pending_write = nil
+	M._pending_write_cancel = nil
+	if pending_cancel then
+		pcall(pending_cancel)
+	end
+	local current = M._edit
+	local scheduled = M._edit_scheduled
+	M._edit_scheduled = nil
+	M._edit = nil
+	M._held = nil
+	M.clear_edit()
+	local queued = M._edit_queue
+	M._edit_queue = {}
+	M._edit_busy = false
+	if ack and daemon.job and daemon.ready then
+		local function release(id)
+			if id then
+				vim.fn.chansend(daemon.job, vim.json.encode({ cmd = "edit_done", id = id, message = "cancelled" }) .. "\n")
+			end
+		end
+		release(current and current.id)
+		release(scheduled and scheduled.id)
+		for _, item in ipairs(queued) do
+			release(item.id)
+		end
 	end
 end
 
@@ -1575,9 +1658,49 @@ function M._do_edit(msg)
 		M.toast("✎ editing " .. name .. " — " .. M.prefix .. "g to follow")
 	end
 
-	if b_hi <= b_lo then -- pure deletion: drop the lines, nothing to type
-		vim.api.nvim_buf_set_lines(buf, a_lo, a_hi, false, {})
-		finish()
+	local target
+	if M.follow then
+		local insertion = a_lo == a_hi
+		local top = vim.api.nvim_buf_set_extmark(buf, region_ns, a_lo, 0, { right_gravity = true, strict = false })
+		local bot = vim.api.nvim_buf_set_extmark(buf, region_ns, a_hi, 0, {
+			right_gravity = insertion,
+			strict = false,
+		})
+		target = {
+			buf = buf,
+			top = top,
+			bot = bot,
+			original = table.concat(vim.api.nvim_buf_get_lines(buf, a_lo, a_hi, false), "\n"),
+		}
+	end
+	local function clear_target()
+		if target and vim.api.nvim_buf_is_valid(target.buf) then
+			pcall(vim.api.nvim_buf_del_extmark, target.buf, region_ns, target.top)
+			pcall(vim.api.nvim_buf_del_extmark, target.buf, region_ns, target.bot)
+		end
+	end
+	local function target_rows()
+		if not target then
+			return a_lo, a_hi
+		end
+		local top = mark_pos_ns(target.buf, region_ns, target.top)
+		local bot = mark_pos_ns(target.buf, region_ns, target.bot)
+		clear_target()
+		if top == nil or bot == nil or top > bot then
+			error("pending edit target was lost")
+		end
+		local current = table.concat(vim.api.nvim_buf_get_lines(target.buf, top, bot, false), "\n")
+		if current ~= target.original then
+			error("pending edit target changed while waiting for confirmation")
+		end
+		return top, bot
+	end
+	if b_hi <= b_lo then -- pure deletion: gate the mutation even though there is nothing to type
+		gated_write(function()
+			local lo, hi = target_rows()
+			vim.api.nvim_buf_set_lines(buf, lo, hi, false, {})
+			finish()
+		end, clear_target)
 		return
 	end
 	-- reserve a single line where the change goes, then typewrite the new span into it
@@ -1585,19 +1708,20 @@ function M._do_edit(msg)
 	for i = b_lo + 1, b_hi do
 		span[#span + 1] = new_lines[i]
 	end
-	vim.api.nvim_buf_set_lines(buf, a_lo, a_hi, false, { "" })
 	local intervals = { char = 38, word = 75, line = 120, paragraph = 250 }
 	local gran = M.granularity
 	gated_write(function()
+		local lo, hi = target_rows()
+		vim.api.nvim_buf_set_lines(buf, lo, hi, false, { "" })
 		M.type_out(table.concat(span, "\n"), {
 			buf = buf,
-			row = a_lo,
+			row = lo,
 			col = 0,
 			granularity = gran,
 			interval = intervals[gran] or 35,
 			on_done = finish,
 		})
-	end)
+	end, clear_target)
 end
 
 -- The agent's tandem_region tool: replace ONLY a marked region (a selection the user
@@ -1625,8 +1749,8 @@ function M._do_region(msg)
 	end
 	local tr, tc = mark_pos_ns(r.buf, r.ns or region_ns, r.top)
 	local br, bc = mark_pos_ns(r.buf, r.ns or region_ns, r.bot)
-	region_clear_marks(r) -- consumed → drop its ⟨implementing⟩ labels
 	if not tr or not br then
+		region_clear_marks(r)
 		send_cmd({ cmd = "edit_done", id = msg.id, message = "region markers were lost" })
 		M._edit_next()
 		return
@@ -1636,9 +1760,6 @@ function M._do_region(msg)
 	local content = msg.content or ""
 	if r.kind == "insert" then
 		content = "\n" .. content -- new lines just below the marked point (cursor)
-	else
-		-- replace: clear the old region content, collapsing to the point at (tr,tc)
-		pcall(vim.api.nvim_buf_set_text, r.buf, tr, tc, br, bc, { "" })
 	end
 	if M.follow then
 		if M._close_chat then
@@ -1652,10 +1773,19 @@ function M._do_region(msg)
 	local intervals = { char = 38, word = 75, line = 120, paragraph = 250 }
 	local gran = M.granularity
 	gated_write(function()
+		local row, col = mark_pos_ns(r.buf, r.ns or region_ns, r.top)
+		local end_row, end_col = mark_pos_ns(r.buf, r.ns or region_ns, r.bot)
+		region_clear_marks(r)
+		if row == nil or end_row == nil then
+			error("pending region target was lost")
+		end
+		if r.kind ~= "insert" then
+			vim.api.nvim_buf_set_text(r.buf, row, col, end_row, end_col, { "" })
+		end
 		M.type_out(content, {
 			buf = r.buf,
-			row = tr,
-			col = tc,
+			row = row,
+			col = col,
 			granularity = gran,
 			interval = intervals[gran] or 35,
 			on_done = function()
@@ -1669,6 +1799,8 @@ function M._do_region(msg)
 				M._edit_next() -- run the next queued edit, if any
 			end,
 		})
+	end, function()
+		region_clear_marks(r)
 	end)
 end
 
@@ -1861,6 +1993,12 @@ function M.interrupt_edit()
 		return
 	end
 	M.pause() -- freeze the typewriter
+	local pending_cancel = M._pending_write_cancel
+	M._pending_write = nil
+	M._pending_write_cancel = nil
+	if pending_cancel then
+		pcall(pending_cancel)
+	end
 	M._drain_edit_queue() -- release any writes queued behind this one (turn is ending)
 	M._drain_region_queue() -- withdraw any regions armed for this turn
 	stream.on_done = nil -- don't let a stray resume auto-ack
@@ -1967,8 +2105,7 @@ end
 -- Global cancel: stop EVERYTHING Tandem is doing — abort all running turns, stop the
 -- typewriter mid-type, and clear the spinner / toasts / pending question.
 function M.cancel_all()
-	M.pause() -- stop any in-progress typing
-	M._drain_edit_queue() -- release any queued (blocked) writes
+	M._reset_edit_state(true)
 	M._drain_region_queue() -- withdraw any armed regions
 	if daemon.job and daemon.ready then
 		vim.fn.chansend(daemon.job, vim.json.encode({ cmd = "cancel_all" }) .. "\n")
